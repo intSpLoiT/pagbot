@@ -7,7 +7,6 @@ import sys
 from types import FrameType
 
 from config.config import load_config
-from core.bot import PAGBot
 from core.logger import setup_logger
 
 
@@ -16,7 +15,6 @@ from core.logger import setup_logger
 # ============================================================
 
 _shutdown_event: asyncio.Event | None = None
-_bot: PAGBot | None = None
 
 
 # ============================================================
@@ -31,10 +29,10 @@ def _handle_shutdown_signal(
     İşletim sistemi kapanış sinyallerini yakalar.
     """
 
-    if _shutdown_event is None:
-        return
+    event = _shutdown_event
 
-    _shutdown_event.set()
+    if event is not None and not event.is_set():
+        event.set()
 
 
 # ============================================================
@@ -48,18 +46,21 @@ def _register_signal_handlers(
     Kontrollü kapanış sinyallerini kaydeder.
     """
 
-    signals = (
+    event = _shutdown_event
+
+    if event is None:
+        return
+
+    for sig in (
         signal.SIGINT,
         signal.SIGTERM,
-    )
-
-    for sig in signals:
+    ):
 
         try:
 
             loop.add_signal_handler(
                 sig,
-                _shutdown_event.set,
+                event.set,
             )
 
         except (
@@ -85,15 +86,14 @@ async def run_bot() -> None:
         ↓
     Logger
         ↓
-    PAGBot
+    Lazy PAGBot import
         ↓
-    Discord
+    Discord bağlantısı
         ↓
     Kontrollü kapanış
     """
 
     global _shutdown_event
-    global _bot
 
     # ========================================================
     # CONFIG
@@ -127,10 +127,14 @@ async def run_bot() -> None:
     )
 
     # ========================================================
-    # BOT
+    # LAZY BOT IMPORT
     # ========================================================
 
-    _bot = PAGBot(
+    # PAGBot ve onun servis/cog import zinciri
+    # config ve logger hazırlandıktan sonra yüklenir.
+    from core.bot import PAGBot
+
+    bot = PAGBot(
         config=config,
         logger=logger,
     )
@@ -141,7 +145,7 @@ async def run_bot() -> None:
             "Connecting to Discord...",
         )
 
-        await _bot.start(
+        await bot.start(
             config.discord_token,
         )
 
@@ -153,12 +157,6 @@ async def run_bot() -> None:
 
         raise
 
-    except KeyboardInterrupt:
-
-        logger.info(
-            "Keyboard interrupt received.",
-        )
-
     except Exception:
 
         logger.exception(
@@ -169,17 +167,15 @@ async def run_bot() -> None:
 
     finally:
 
-        if _bot is not None:
+        try:
 
-            try:
+            await bot.close()
 
-                await _bot.close()
+        except Exception:
 
-            except Exception:
-
-                logger.exception(
-                    "Failed to close bot cleanly.",
-                )
+            logger.exception(
+                "Failed to close bot cleanly.",
+            )
 
         logger.info(
             "PAG Bot stopped.",
