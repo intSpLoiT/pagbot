@@ -1,106 +1,48 @@
-"""
-PAG Core
-Main Discord Bot
-
-This module contains the main PAG Core Discord bot class.
-
-The PAGBot class is responsible for:
-
-- Configuring Discord intents
-- Managing the database lifecycle
-- Loading application extensions
-- Synchronizing slash commands
-- Handling the Discord ready event
-- Tracking connection state
-- Handling graceful shutdowns
-- Managing application-level bot state
-
-Application startup flow:
-
-    main.py
-        |
-        v
-    PAGBot()
-        |
-        v
-    setup_hook()
-        |
-        +--> Connect database
-        |
-        +--> Initialize database
-        |
-        +--> Load extensions
-        |
-        +--> Sync commands
-        |
-        v
-    Discord login
-        |
-        v
-    on_ready()
-        |
-        v
-    PAG Core ONLINE
-"""
-
-
 from __future__ import annotations
 
-
-import time
-from typing import Final
+import logging
+from typing import Any
 
 import discord
-import importlib
-import pkgutil
-
-import cogs
 from discord.ext import commands
 
-
-from config.constants import (
-    BOT_NAME,
-    BOT_VERSION,
-)
-
-
+from config.config import Config
 from core.database import Database
-from core.logger import logger
+from core.loader import CogLoader
+from services.discord_service import DiscordService
+from services.event_service import EventService
+from services.roblox_service import RobloxService
 
 
 class PAGBot(commands.Bot):
     """
-    Main Discord bot class for PAG Core.
+    PAG Bot ana Discord bot sınıfı.
 
-    PAGBot acts as the central application controller.
+    Sorumlulukları:
 
-    Other systems communicate with the bot through:
-
-        self.database
-
-        self.services
-
-        self.config
-
-        self.application_state
-
-    The bot itself should remain responsible for the
-    application lifecycle rather than containing all business
-    logic directly.
+    - Discord bağlantısı
+    - Database yaşam döngüsü
+    - RobloxService yaşam döngüsü
+    - DiscordService yaşam döngüsü
+    - EventService başlatılması
+    - Cog yükleme
+    - Guild kontrolü
+    - Kontrollü kapanış
     """
 
+    def __init__(
+        self,
+        *,
+        config: Config,
+        logger: logging.Logger,
+    ) -> None:
 
-    def __init__(self) -> None:
-        """
-        Initialize PAG Core.
+        intents = discord.Intents.default()
 
-        Discord intents are configured here before the bot
-        connects to Discord.
-        """
-
-
-        intents = self._create_intents()
-
+        intents.guilds = True
+        intents.members = True
+        intents.messages = True
+        intents.message_content = True
 
         super().__init__(
             command_prefix="!",
@@ -108,873 +50,296 @@ class PAGBot(commands.Bot):
             help_command=None,
         )
 
+        self.config = config
+        self.logger = logger
 
-        self.database: Final[
-            Database
-        ] = Database()
+        self.database = Database(
+            database_path=config.database_path,
+            logger=logger,
+        )
 
+        self.roblox_service = RobloxService(
+            logger=logger,
+        )
 
-        self.start_time: float = time.time()
+        self.event_service = EventService(
+            database=self.database,
+            logger=logger,
+        )
 
+        self.discord_service = DiscordService(
+            logger=logger,
+        )
 
-        self.is_fully_ready: bool = False
+        self.cog_loader = CogLoader(
+            self,
+            logger,
+        )
 
+        self._started = False
+        self._closed = False
 
-        self.is_shutting_down: bool = False
-
-
-        self._ready_event = False
-
-
-    @staticmethod
-    def _create_intents() -> discord.Intents:
-        """
-        Create and configure Discord intents.
-
-        The current PAG Core system requires member access
-        because several future systems depend on Discord
-        guild members.
-
-        Required systems include:
-
-        - Role Info
-        - Rank management
-        - Member Spotlight
-        - Leaderboards
-        - Member synchronization
-        """
-
-        intents = discord.Intents.default()
-
-
-        intents.guilds = True
-
-
-        intents.members = True
-
-
-        intents.guild_messages = True
-
-
-        intents.message_content = True
-
-
-        return intents
-
+    # ========================================================
+    # SETUP HOOK
+    # ========================================================
 
     async def setup_hook(self) -> None:
         """
-        Run application initialization before Discord becomes
-        fully ready.
+        Discord bağlantısı kurulmadan önce çalışır.
 
-        This is the main startup lifecycle.
+        Ağır işlemleri on_ready içine koymuyoruz.
 
-        Startup sequence:
-
-            1. Log startup information
-            2. Connect to database
-            3. Initialize database schema
-            4. Load extensions
-            5. Synchronize slash commands
-            6. Finish startup preparation
-
-        Discord's on_ready event is triggered later when the
-        bot has successfully connected to Discord.
+        Böylece:
+            - Cog'lar birden fazla kez yüklenmez.
+            - Database başlangıcı kontrollü olur.
+            - Servisler hazır olmadan komutlar çalışmaz.
+            - Reconnect sırasında initialization tekrarlanmaz.
         """
 
-        self._log_startup()
+        if self._started:
+            return
 
-
-        await self._initialize_database()
-
-
-        await self._load_extensions()
-
-
-        await self._sync_commands()
-
-
-        logger.info(
-            "Startup preparation completed."
+        self.logger.info(
+            "Starting PAG Bot initialization...",
         )
 
+        # ====================================================
+        # DATABASE
+        # ====================================================
 
-    async def _initialize_database(self) -> None:
-        """
-        Initialize the database connection and schema.
-        """
+        await self.database.connect()
 
-        logger.info(
-            "Initializing database..."
+        self.logger.info(
+            "Database connected.",
         )
 
+        # ====================================================
+        # MIGRATIONS
+        # ====================================================
 
-        try:
+        await self._run_migrations()
 
-            await self.database.connect()
+        # ====================================================
+        # ROBLOX SERVICE
+        # ====================================================
 
+        await self.roblox_service.start()
 
-            await self.database.initialize()
-
-
-        except Exception:
-
-            logger.exception(
-                "Database initialization failed."
-            )
-
-
-            raise
-
-
-        logger.info(
-            "Database initialization completed."
+        self.logger.info(
+            "Roblox service started.",
         )
 
+        # ====================================================
+        # DISCORD SERVICE
+        # ====================================================
 
-    async def _load_extensions(self) -> None:
+        await self._start_discord_service()
+
+        # ====================================================
+        # EVENT SERVICE
+        # ====================================================
+
+        await self._start_event_service()
+
+        # ====================================================
+        # COGS
+        # ====================================================
+
+        await self.cog_loader.load_all()
+
+        self._started = True
+
+        self.logger.info(
+            "PAG Bot initialization completed.",
+        )
+
+    # ========================================================
+    # MIGRATIONS
+    # ========================================================
+
+    async def _run_migrations(self) -> None:
         """
-        Automatically discover and load all valid extensions
-        from the cogs package.
+        Database migration sistemini çalıştırır.
 
-        The extension loader is designed to be:
-
-        - Automatic
-        - Safe
-        - Extensible
-        - Debug-friendly
-        - Resistant to invalid files
-        - Compatible with nested Cog packages
-
-        Expected structure:
-
-            cogs/
-            ├── __init__.py
-            ├── system.py
-            ├── roblox.py
-            ├── profiles.py
-            │
-            └── admin/
-                ├── __init__.py
-                ├── moderation.py
-                └── configuration.py
-
-        Every valid Python module containing a valid Discord
-        extension can be automatically discovered and loaded.
-
-        The loader does not require every Cog to be manually
-        added to a hardcoded list.
-
-        This means that adding a new Cog is as simple as:
-
-            cogs/new_feature.py
-
-        The bot will automatically discover it on startup.
+        MigrationManager'ın mevcut yapısı
+        database ve logger ile çalışır.
         """
 
+        from core.migrations import MigrationManager
 
-        logger.info(
-            "Beginning extension discovery."
+        migration_manager = MigrationManager(
+            database=self.database,
+            logger=self.logger,
         )
 
+        await migration_manager.run()
 
-        extension_package_name = "cogs"
-
-
-        try:
-
-            extension_package = importlib.import_module(
-                extension_package_name
-            )
-
-
-        except ModuleNotFoundError:
-
-            logger.exception(
-                "The cogs package could not be imported."
-            )
-
-
-            raise
-
-
-        except Exception:
-
-            logger.exception(
-                "Unexpected error while importing "
-                "the cogs package."
-            )
-
-
-            raise
-
-
-        if not hasattr(
-            extension_package,
-            "__path__",
-        ):
-
-            logger.error(
-                "The cogs package does not have "
-                "a valid package path."
-            )
-
-
-            raise RuntimeError(
-                "The cogs package is not a valid package."
-            )
-
-
-        discovered_extensions: list[str] = []
-
-
-        failed_discoveries: list[str] = []
-
-
-        logger.info(
-            "Scanning extension package: %s",
-            extension_package_name,
+        self.logger.info(
+            "Database migrations completed.",
         )
 
+    # ========================================================
+    # DISCORD SERVICE
+    # ========================================================
 
-        try:
+    async def _start_discord_service(self) -> None:
+        """
+        DiscordService varsa yaşam döngüsünü başlatır.
 
-            module_iterator = pkgutil.walk_packages(
-                extension_package.__path__,
-                prefix=(
-                    f"{extension_package_name}."
-                ),
-            )
+        Service start() metoduna sahipse çağrılır.
+        Böylece servis kullanılmadan önce hazır olur.
+        """
 
-
-        except Exception:
-
-            logger.exception(
-                "Failed to scan the extension package."
-            )
-
-
-            raise
-
-
-        for module_info in module_iterator:
-
-            module_name = module_info.name
-
-
-            is_package = module_info.ispkg
-
-
-            if not module_name:
-
-                continue
-
-
-            if module_name.endswith(
-                ".__init__"
-            ):
-
-                continue
-
-
-            module_parts = module_name.split(
-                "."
-            )
-
-
-            if any(
-                part.startswith("_")
-                for part in module_parts
-            ):
-
-                logger.debug(
-                    "Skipping private extension: %s",
-                    module_name,
-                )
-
-
-                continue
-
-
-            if is_package:
-
-                logger.debug(
-                    "Skipping package directory: %s",
-                    module_name,
-                )
-
-
-                continue
-
-
-            if not module_name.endswith(
-                ".py"
-            ):
-
-                pass
-
-
-            discovered_extensions.append(
-                module_name
-            )
-
-
-        discovered_extensions = sorted(
-            set(
-                discovered_extensions
-            )
+        start_method = getattr(
+            self.discord_service,
+            "start",
+            None,
         )
 
-
-        if not discovered_extensions:
-
-            logger.warning(
-                "No extensions were discovered."
+        if start_method is None:
+            self.logger.info(
+                "Discord service has no start hook.",
             )
-
 
             return
 
+        await start_method()
 
-        logger.info(
-            "Discovered %d extension(s).",
-            len(
-                discovered_extensions
-            ),
+        self.logger.info(
+            "Discord service started.",
         )
 
-
-        loaded_extensions: list[str] = []
-
-
-        skipped_extensions: list[str] = []
-
-
-        failed_extensions: dict[
-            str,
-            str,
-        ] = {}
-
-
-        for extension_name in (
-            discovered_extensions
-        ):
-
-            logger.info(
-                "Preparing extension: %s",
-                extension_name,
-            )
-
-
-            if extension_name in (
-                self.extensions
-            ):
-
-                logger.warning(
-                    "Extension already loaded: %s",
-                    extension_name,
-                )
-
-
-                skipped_extensions.append(
-                    extension_name
-                )
-
-
-                continue
-
-
-            try:
-
-                extension_module = importlib.import_module(
-                    extension_name
-                )
-
-
-            except ModuleNotFoundError as error:
-
-                error_message = (
-                    f"ModuleNotFoundError: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Failed to import extension: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            except ImportError as error:
-
-                error_message = (
-                    f"ImportError: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Import error while importing: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            except Exception as error:
-
-                error_message = (
-                    f"{type(error).__name__}: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Unexpected error while importing: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            if not hasattr(
-                extension_module,
-                "setup",
-            ):
-
-                logger.warning(
-                    "Skipping invalid extension: %s",
-                    extension_name,
-                )
-
-
-                logger.warning(
-                    "Reason: missing setup() function."
-                )
-
-
-                skipped_extensions.append(
-                    extension_name
-                )
-
-
-                continue
-
-
-            setup_function = getattr(
-                extension_module,
-                "setup",
-            )
-
-
-            if not callable(
-                setup_function
-            ):
-
-                logger.warning(
-                    "Skipping invalid extension: %s",
-                    extension_name,
-                )
-
-
-                logger.warning(
-                    "Reason: setup is not callable."
-                )
-
-
-                skipped_extensions.append(
-                    extension_name
-                )
-
-
-                continue
-
-
-            try:
-
-                await self.load_extension(
-                    extension_name
-                )
-
-
-            except commands.ExtensionAlreadyLoaded:
-
-                logger.warning(
-                    "Extension already loaded: %s",
-                    extension_name,
-                )
-
-
-                skipped_extensions.append(
-                    extension_name
-                )
-
-
-                continue
-
-
-            except commands.ExtensionNotFound as error:
-
-                error_message = (
-                    f"ExtensionNotFound: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Extension file could not be loaded: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            except commands.NoEntryPointError as error:
-
-                error_message = (
-                    f"NoEntryPointError: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Extension has no valid setup entry point: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            except commands.ExtensionFailed as error:
-
-                error_message = (
-                    f"ExtensionFailed: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Extension setup failed: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            except Exception as error:
-
-                error_message = (
-                    f"{type(error).__name__}: {error}"
-                )
-
-
-                failed_extensions[
-                    extension_name
-                ] = error_message
-
-
-                logger.exception(
-                    "Unexpected error while loading: %s",
-                    extension_name,
-                )
-
-
-                continue
-
-
-            loaded_extensions.append(
-                extension_name
-            )
-
-
-            logger.info(
-                "Extension loaded successfully: %s",
-                extension_name,
-            )
-
-
-        logger.info(
-            "Extension discovery completed."
-        )
-
-
-        logger.info(
-            "Total discovered: %d",
-            len(
-                discovered_extensions
-            ),
-        )
-
-
-        logger.info(
-            "Total loaded: %d",
-            len(
-                loaded_extensions
-            ),
-        )
-
-
-        logger.info(
-            "Total skipped: %d",
-            len(
-                skipped_extensions
-            ),
-        )
-
-
-        logger.info(
-            "Total failed: %d",
-            len(
-                failed_extensions
-            ),
-        )
-
-
-        if loaded_extensions:
-
-            logger.info(
-                "Loaded extensions: %s",
-                ", ".join(
-                    loaded_extensions
-                ),
-            )
-
-
-        if skipped_extensions:
-
-            logger.info(
-                "Skipped extensions: %s",
-                ", ".join(
-                    skipped_extensions
-                ),
-            )
-
-
-        if failed_extensions:
-
-            logger.error(
-                "One or more extensions failed to load."
-            )
-
-
-            for (
-                extension_name,
-                error_message,
-            ) in failed_extensions.items():
-
-                logger.error(
-                    "%s -> %s",
-                    extension_name,
-                    error_message,
-                )
-
-
-        if failed_extensions:
-
-            logger.warning(
-                "PAG Core started with extension errors."
-            )
-
-
-        else:
-
-            logger.info(
-                "All discovered extensions loaded successfully."
-            )
-
-
-    async def _sync_commands(self) -> None:
+    # ========================================================
+    # EVENT SERVICE
+    # ========================================================
+
+    async def _start_event_service(self) -> None:
         """
-        Synchronize application slash commands with Discord.
+        EventService başlangıç hook'unu çalıştırır.
 
-        Global slash commands may take time to propagate.
-
-        During development, commands can later be synchronized
-        to a development guild for faster testing.
+        EventService'in mevcut API'sine göre
+        kullanılabilir yaşam döngüsü metodunu çağırır.
         """
 
-        logger.info(
-            "Synchronizing application commands..."
+        start_method = getattr(
+            self.event_service,
+            "start",
+            None,
         )
 
-
-        try:
-
-            synced = await self.tree.sync()
-
-
-        except Exception:
-
-            logger.exception(
-                "Application command synchronization failed."
+        if start_method is None:
+            self.logger.info(
+                "Event service has no start hook.",
             )
 
+            return
 
-            raise
+        await start_method()
 
-
-        logger.info(
-            "Application commands synchronized: %d",
-            len(synced),
+        self.logger.info(
+            "Event service started.",
         )
 
-
-    def _log_startup(self) -> None:
-        """
-        Log application startup information.
-        """
-
-        logger.info(
-            "Starting %s",
-            BOT_NAME,
-        )
-
-
-        logger.info(
-            "Version: %s",
-            BOT_VERSION,
-        )
-
-
-        logger.info(
-            "Initializing Discord connection..."
-        )
-
+    # ========================================================
+    # READY
+    # ========================================================
 
     async def on_ready(self) -> None:
         """
-        Handle the Discord ready event.
+        Discord bağlantısı hazır olduğunda çalışır.
 
-        This event is triggered when the bot has successfully
-        connected and Discord has completed the initial
-        connection process.
-
-        The method is designed to be safe if Discord reconnects
-        and triggers the ready event again.
+        Burada ağır initialization yapılmaz.
+        on_ready reconnect durumunda birden fazla kez
+        çalışabileceği için sadece durum loglanır.
         """
 
         if self.user is None:
-
-            logger.warning(
-                "Ready event received without bot user."
-            )
-
-
             return
 
-
-        self._ready_event = True
-
-
-        self.is_fully_ready = True
-
-
-        logger.info(
-            "Discord connection established."
-        )
-
-
-        logger.info(
-            "Logged in as: %s",
+        self.logger.info(
+            "Connected to Discord as %s (%s).",
             self.user,
-        )
-
-
-        logger.info(
-            "Bot ID: %s",
             self.user.id,
         )
 
-
-        logger.info(
-            "Guild count: %d",
+        self.logger.info(
+            "Connected guilds: %s.",
             len(self.guilds),
         )
 
+    # ========================================================
+    # GUILD JOIN
+    # ========================================================
 
-        logger.info(
-            "Latency: %.2f ms",
-            self.latency * 1000,
-        )
-
-
-        logger.info(
-            "PAG Core is now ONLINE."
-        )
-
-
-    async def on_resumed(self) -> None:
+    async def on_guild_join(
+        self,
+        guild: discord.Guild,
+    ) -> None:
         """
-        Handle a successful Discord session resume.
+        Bot yalnızca yapılandırılmış PAG guild'inde çalışır.
 
-        Discord may reconnect the bot after a temporary
-        connection interruption.
+        Başka bir sunucuya eklenirse otomatik olarak ayrılır.
         """
 
-        logger.info(
-            "Discord session resumed."
+        allowed_guild_id = (
+            self.config.discord_guild_id
         )
 
+        if guild.id == allowed_guild_id:
 
-        logger.info(
-            "PAG Core connection restored."
+            self.logger.info(
+                "Joined allowed guild: %s (%s).",
+                guild.name,
+                guild.id,
+            )
+
+            return
+
+        self.logger.warning(
+            (
+                "Unauthorized guild detected: "
+                "%s (%s). Leaving."
+            ),
+            guild.name,
+            guild.id,
         )
 
+        try:
 
-    async def on_disconnect(self) -> None:
+            await guild.leave()
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                (
+                    "Failed to leave unauthorized "
+                    "guild: %s (%s)."
+                ),
+                guild.name,
+                guild.id,
+            )
+
+    # ========================================================
+    # GUILD REMOVE
+    # ========================================================
+
+    async def on_guild_remove(
+        self,
+        guild: discord.Guild,
+    ) -> None:
         """
-        Handle a Discord disconnection.
-
-        A disconnection does not necessarily mean that the
-        application has permanently stopped.
-
-        discord.py may automatically reconnect.
+        PAG guild'inden ayrılma durumunu loglar.
         """
 
-        self.is_fully_ready = False
-
-
-        logger.warning(
-            "Discord connection lost."
+        self.logger.warning(
+            "Bot removed from guild: %s (%s).",
+            guild.name,
+            guild.id,
         )
 
-
-        logger.warning(
-            "Waiting for Discord reconnection..."
-        )
-
+    # ========================================================
+    # COMMAND ERROR
+    # ========================================================
 
     async def on_command_error(
         self,
@@ -982,265 +347,152 @@ class PAGBot(commands.Bot):
         exception: commands.CommandError,
     ) -> None:
         """
-        Handle traditional prefix command errors.
+        Prefix command hatalarını loglar.
 
-        Slash command errors are handled separately through
-        application command error handlers.
+        Slash command hataları ilgili Cog'ların
+        app command error handler'ları tarafından yönetilir.
         """
-
-        logger.error(
-            "Command error: %s",
-            exception,
-        )
-
 
         if isinstance(
             exception,
             commands.CommandNotFound,
         ):
-
             return
 
-
-        if context.channel is not None:
-
-            try:
-
-                await context.send(
-                    "An unexpected error occurred."
-                )
-
-
-            except discord.HTTPException:
-
-                logger.exception(
-                    "Failed to send command error message."
-                )
-
-
-    async def on_app_command_error(
-        self,
-        interaction: discord.Interaction,
-        exception: discord.app_commands.AppCommandError,
-    ) -> None:
-        """
-        Handle slash command errors.
-
-        This provides a centralized fallback for application
-        command failures.
-        """
-
-        logger.exception(
-            "Application command error.",
-            exc_info=exception,
-        )
-
-
-        if interaction.response.is_done():
-
-            try:
-
-                await interaction.followup.send(
-                    "An unexpected error occurred.",
-                    ephemeral=True,
-                )
-
-
-            except discord.HTTPException:
-
-                logger.exception(
-                    "Failed to send slash command error."
-                )
-
-
-        else:
-
-            try:
-
-                await interaction.response.send_message(
-                    "An unexpected error occurred.",
-                    ephemeral=True,
-                )
-
-
-            except discord.HTTPException:
-
-                logger.exception(
-                    "Failed to respond to slash command error."
-                )
-
-
-    def get_uptime(self) -> int:
-        """
-        Return the current bot uptime in seconds.
-        """
-
-        return int(
-            time.time()
-            - self.start_time
-        )
-
-
-    def get_uptime_formatted(self) -> str:
-        """
-        Return the current bot uptime in a readable format.
-
-        Example:
-
-            2d 4h 31m 12s
-        """
-
-        total_seconds = self.get_uptime()
-
-
-        days, remainder = divmod(
-            total_seconds,
-            86400,
-        )
-
-
-        hours, remainder = divmod(
-            remainder,
-            3600,
-        )
-
-
-        minutes, seconds = divmod(
-            remainder,
-            60,
-        )
-
-
-        parts: list[str] = []
-
-
-        if days:
-
-            parts.append(
-                f"{days}d"
-            )
-
-
-        if hours:
-
-            parts.append(
-                f"{hours}h"
-            )
-
-
-        if minutes:
-
-            parts.append(
-                f"{minutes}m"
-            )
-
-
-        parts.append(
-            f"{seconds}s"
-        )
-
-
-        return " ".join(
-            parts
-        )
-
-
-    def get_status_data(self) -> dict[str, object]:
-        """
-        Return a snapshot of the current bot state.
-
-        This can later be used by:
-
-        - Status commands
-        - Health checks
-        - Web dashboards
-        - Monitoring systems
-        """
-
-        return {
-
-            "name": BOT_NAME,
-
-            "version": BOT_VERSION,
-
-            "online": self.is_fully_ready,
-
-            "connected": not self.is_closed(),
-
-            "guilds": len(
-                self.guilds
+        self.logger.error(
+            "Command error: %s",
+            exception,
+            exc_info=(
+                type(exception),
+                exception,
+                exception.__traceback__,
             ),
+        )
 
-            "latency_ms": round(
-                self.latency * 1000,
-                2,
-            ),
-
-            "uptime_seconds": self.get_uptime(),
-
-            "uptime": self.get_uptime_formatted(),
-
-        }
-
+    # ========================================================
+    # CLOSE
+    # ========================================================
 
     async def close(self) -> None:
         """
-        Gracefully shut down PAG Core.
+        Tüm servisleri kontrollü sırayla kapatır.
 
-        Shutdown sequence:
-
-            1. Prevent duplicate shutdown attempts
-            2. Mark the application offline
-            3. Close the database
-            4. Close the Discord connection
-            5. Log shutdown completion
+        Kapanış sırasında herhangi bir kaynak açık
+        bırakılmaması amaçlanır.
         """
 
-        if self.is_shutting_down:
-
-            logger.warning(
-                "Shutdown already in progress."
-            )
-
-
+        if self._closed:
             return
 
+        self._closed = True
 
-        self.is_shutting_down = True
-
-
-        self.is_fully_ready = False
-
-
-        logger.info(
-            "PAG Core shutdown initiated."
+        self.logger.info(
+            "Shutting down PAG Bot...",
         )
 
+        # ====================================================
+        # COGS
+        # ====================================================
+
+        try:
+
+            await self.cog_loader.unload_all()
+
+        except Exception:
+
+            self.logger.exception(
+                "Failed to unload one or more cogs.",
+            )
+
+        # ====================================================
+        # DISCORD SERVICE
+        # ====================================================
+
+        await self._close_service(
+            self.discord_service,
+            "Discord service",
+        )
+
+        # ====================================================
+        # EVENT SERVICE
+        # ====================================================
+
+        await self._close_service(
+            self.event_service,
+            "Event service",
+        )
+
+        # ====================================================
+        # ROBLOX SERVICE
+        # ====================================================
+
+        await self._close_service(
+            self.roblox_service,
+            "Roblox service",
+        )
+
+        # ====================================================
+        # DATABASE
+        # ====================================================
 
         try:
 
             await self.database.close()
 
+            self.logger.info(
+                "Database closed.",
+            )
 
         except Exception:
 
-            logger.exception(
-                "Database shutdown failed."
+            self.logger.exception(
+                "Failed to close database.",
             )
 
+        # ====================================================
+        # DISCORD
+        # ====================================================
+
+        await super().close()
+
+        self.logger.info(
+            "PAG Bot shutdown completed.",
+        )
+
+    # ========================================================
+    # SERVICE CLOSE HELPER
+    # ========================================================
+
+    async def _close_service(
+        self,
+        service: Any,
+        service_name: str,
+    ) -> None:
+        """
+        Service close() metodunu varsa çalıştırır.
+        """
+
+        close_method = getattr(
+            service,
+            "close",
+            None,
+        )
+
+        if close_method is None:
+            return
 
         try:
 
-            await super().close()
+            await close_method()
 
+            self.logger.info(
+                "%s closed.",
+                service_name,
+            )
 
         except Exception:
 
-            logger.exception(
-                "Discord client shutdown failed."
+            self.logger.exception(
+                "Failed to close %s.",
+                service_name,
             )
-
-
-        logger.info(
-            "PAG Core is now OFFLINE."
-        )

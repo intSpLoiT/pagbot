@@ -1,1401 +1,965 @@
-"""
-PAG Core
-Roblox Service
-
-This module contains the complete Roblox integration layer
-for PAG Core.
-
-The service layer is responsible for:
-
-    - Communicating with Roblox APIs
-    - Resolving usernames to user IDs
-    - Retrieving user profiles
-    - Retrieving avatar thumbnails
-    - Searching Roblox users
-    - Managing HTTP sessions
-    - Managing request timeouts
-    - Handling rate limits
-    - Handling temporary API failures
-    - Caching frequently requested data
-    - Returning normalized application data
-
-The Discord Cog must not directly communicate with
-Roblox APIs.
-
-Architecture:
-
-    Discord Command
-            |
-            v
-        RobloxCog
-            |
-            v
-        RobloxService
-            |
-            +----------------------+
-            |                      |
-            v                      v
-       Users API             Thumbnails API
-            |                      |
-            +----------+-----------+
-                       |
-                       v
-                 Normalized Data
-                       |
-                       v
-                  Discord Cog
-
-
-Supported flow:
-
-    Username
-        |
-        v
-    Resolve User
-        |
-        v
-    Roblox User ID
-        |
-        +--> User Profile
-        |
-        +--> Avatar Thumbnail
-        |
-        +--> Roblox Profile URL
-        |
-        +--> PAG Account Linking
-"""
-
-
 from __future__ import annotations
 
-
 import asyncio
-
-
+import logging
 import time
+from dataclasses import dataclass
+from typing import Any, Iterable
+
+import httpx
+
+from utils.errors import PAGError
 
 
-from dataclasses import (
-    dataclass,
-)
+# ============================================================
+# ERRORS
+# ============================================================
 
 
-from typing import (
-    Any,
-    Final,
-)
+class RobloxServiceError(PAGError):
+    """Roblox API işlemleri sırasında oluşan hatalar."""
 
 
-import aiohttp
+class RobloxNotFoundError(RobloxServiceError):
+    """Roblox kullanıcısı bulunamadığında oluşur."""
 
 
-from core.logger import logger
+class RobloxAPIError(RobloxServiceError):
+    """Roblox API başarısız olduğunda oluşur."""
 
 
-class RobloxServiceError(
-    Exception
-):
-    """
-    Base exception for Roblox service errors.
-    """
+# ============================================================
+# DATA MODELS
+# ============================================================
 
 
-class RobloxUserNotFoundError(
-    RobloxServiceError
-):
-    """
-    Raised when a Roblox user cannot be found.
-    """
-
-
-class RobloxRateLimitError(
-    RobloxServiceError
-):
-    """
-    Raised when Roblox rate-limits a request.
-    """
-
-
-class RobloxAPIError(
-    RobloxServiceError
-):
-    """
-    Raised when Roblox returns an unexpected API error.
-    """
-
-
-class RobloxTimeoutError(
-    RobloxServiceError
-):
-    """
-    Raised when a Roblox request times out.
-    """
-
-
-@dataclass(
-    slots=True,
-)
+@dataclass(slots=True, frozen=True)
 class RobloxUser:
     """
-    Normalized Roblox user representation.
-
-    This object prevents the rest of PAG Core from depending
-    directly on Roblox's raw JSON response structure.
-
-    Future systems can safely use:
-
-        user.username
-
-        user.display_name
-
-        user.user_id
-
-        user.avatar_url
-
-        user.profile_url
+    Roblox kullanıcı bilgileri.
     """
 
-
-    user_id: int
-
-
-    username: str
-
-
+    id: int
+    name: str
     display_name: str
-
-
     description: str
-
-
-    created_at: str | None
-
-
+    created: str
     is_banned: bool
 
 
-    avatar_url: str | None = None
+@dataclass(slots=True, frozen=True)
+class RobloxAvatar:
+    """
+    Roblox avatar bilgileri.
+    """
+
+    user_id: int
+    image_url: str
 
 
-    profile_url: str | None = None
+# ============================================================
+# CACHE
+# ============================================================
 
 
-    has_verified_badge: bool = False
+@dataclass(slots=True)
+class _CacheEntry:
+    """
+    Basit TTL cache entry.
+    """
+
+    value: Any
+    expires_at: float
 
 
-    @property
-    def id(self) -> int:
-        """
-        Alias for user_id.
+class TTLCache:
+    """
+    Küçük ve hafif memory cache.
 
-        This is useful when other parts of the system
-        expect a shorter ID property.
-        """
+    Redis gibi harici bir sistem kullanmıyoruz.
+    PAG Bot için bu yeterli.
+    """
 
-        return self.user_id
+    def __init__(
+        self,
+        ttl: int = 300,
+        max_size: int = 1000,
+    ) -> None:
+        self.ttl = ttl
+        self.max_size = max_size
 
+        self._cache: dict[Any, _CacheEntry] = {}
 
-    def to_dict(self) -> dict[str, Any]:
-        """
-        Convert the user object into a dictionary.
-        """
+    def get(
+        self,
+        key: Any,
+    ) -> Any | None:
+        entry = self._cache.get(key)
 
-        return {
+        if entry is None:
+            return None
 
-            "user_id": self.user_id,
+        if time.monotonic() >= entry.expires_at:
+            self._cache.pop(key, None)
+            return None
 
-            "username": self.username,
+        return entry.value
 
-            "display_name": self.display_name,
+    def set(
+        self,
+        key: Any,
+        value: Any,
+    ) -> None:
+        if len(self._cache) >= self.max_size:
+            self._remove_expired()
 
-            "description": self.description,
+        if len(self._cache) >= self.max_size:
+            oldest_key = next(
+                iter(self._cache)
+            )
 
-            "created_at": self.created_at,
+            self._cache.pop(
+                oldest_key,
+                None,
+            )
 
-            "is_banned": self.is_banned,
-
-            "avatar_url": self.avatar_url,
-
-            "profile_url": self.profile_url,
-
-            "has_verified_badge": (
-                self.has_verified_badge
+        self._cache[key] = _CacheEntry(
+            value=value,
+            expires_at=(
+                time.monotonic() + self.ttl
             ),
+        )
 
-        }
+    def delete(
+        self,
+        key: Any,
+    ) -> None:
+        self._cache.pop(
+            key,
+            None,
+        )
+
+    def clear(self) -> None:
+        self._cache.clear()
+
+    def _remove_expired(self) -> None:
+        now = time.monotonic()
+
+        expired_keys = [
+            key
+            for key, entry in self._cache.items()
+            if now >= entry.expires_at
+        ]
+
+        for key in expired_keys:
+            self._cache.pop(
+                key,
+                None,
+            )
+
+
+# ============================================================
+# ROBLOX SERVICE
+# ============================================================
 
 
 class RobloxService:
     """
-    Main Roblox API service.
+    PAG Bot Roblox API Service.
 
-    The service owns a single reusable aiohttp session.
+    Tasarım hedefleri:
 
-    This is significantly more efficient than creating a new
-    HTTP session for every Discord command.
-
-    Lifecycle:
-
-        RobloxService()
-            |
-            v
-        connect()
-            |
-            v
-        API requests
-            |
-            v
-        close()
-
-    The Discord Cog can also use the service without manually
-    calling connect() because the service automatically prepares
-    the session when needed.
+    - Tek HTTP client
+    - Connection pooling
+    - Async işlemler
+    - Kontrollü paralel istekler
+    - TTL cache
+    - Batch user sorguları
+    - Avatar batch sorguları
+    - Retry sistemi
     """
 
-
-    USERS_BASE_URL: Final[str] = (
-        "https://users.roblox.com"
+    USERS_API = (
+        "https://users.roblox.com/v1"
     )
 
-
-    THUMBNAILS_BASE_URL: Final[str] = (
-        "https://thumbnails.roblox.com"
+    AVATAR_API = (
+        "https://thumbnails.roblox.com/v1"
     )
 
+    DEFAULT_TIMEOUT = 10.0
 
-    AVATAR_BASE_URL: Final[str] = (
-        "https://avatar.roblox.com"
-    )
+    MAX_RETRIES = 3
 
+    RETRY_DELAY = 0.5
 
-    REQUEST_TIMEOUT: Final[float] = 15.0
+    MAX_CONCURRENT_REQUESTS = 10
 
+    USER_CACHE_TTL = 600
 
-    MAX_RETRIES: Final[int] = 3
-
-
-    RETRY_DELAY: Final[float] = 1.0
-
-
-    CACHE_TTL: Final[int] = 300
-
-
-    MAX_CACHE_SIZE: Final[int] = 512
-
+    AVATAR_CACHE_TTL = 300
 
     def __init__(
         self,
+        logger: logging.Logger | None = None,
     ) -> None:
-        """
-        Initialize the Roblox service.
-        """
 
-        self._session: aiohttp.ClientSession | None = (
-            None
+        self.logger = logger
+
+        self._client: httpx.AsyncClient | None = None
+
+        self._request_semaphore = asyncio.Semaphore(
+            self.MAX_CONCURRENT_REQUESTS
         )
 
-
-        self._session_lock = asyncio.Lock()
-
-
-        self._cache: dict[
-            str,
-            tuple[
-                float,
-                Any,
-            ],
-        ] = {}
-
-
-        self._cache_lock = asyncio.Lock()
-
-
-        self._closed: bool = False
-
-
-        self._request_count: int = 0
-
-
-        self._successful_request_count: int = 0
-
-
-        self._failed_request_count: int = 0
-
-
-        logger.info(
-            "RobloxService initialized."
+        self._user_cache = TTLCache(
+            ttl=self.USER_CACHE_TTL,
+            max_size=2000,
         )
 
-
-    async def _ensure_session(
-        self,
-    ) -> aiohttp.ClientSession:
-        """
-        Ensure that a reusable HTTP session exists.
-
-        The lock prevents multiple simultaneous Discord
-        commands from creating multiple sessions at once.
-        """
-
-        if (
-            self._session is not None
-            and not self._session.closed
-        ):
-
-            return self._session
-
-
-        async with self._session_lock:
-
-            if (
-                self._session is not None
-                and not self._session.closed
-            ):
-
-                return self._session
-
-
-            timeout = aiohttp.ClientTimeout(
-                total=self.REQUEST_TIMEOUT,
-                connect=5,
-                sock_read=10,
-            )
-
-
-            headers = {
-
-                "User-Agent": (
-                    "PAG-Core/"
-                    "Roblox-Integration"
-                ),
-
-                "Accept": (
-                    "application/json"
-                ),
-
-            }
-
-
-            self._session = (
-                aiohttp.ClientSession(
-                    timeout=timeout,
-                    headers=headers,
-                )
-            )
-
-
-            self._closed = False
-
-
-            logger.info(
-                "Roblox HTTP session created."
-            )
-
-
-            return self._session
-
-
-    async def connect(
-        self,
-    ) -> None:
-        """
-        Explicitly initialize the Roblox HTTP session.
-
-        This method can be called during application startup.
-        """
-
-        await self._ensure_session()
-
-
-        logger.info(
-            "Roblox service connected."
+        self._avatar_cache = TTLCache(
+            ttl=self.AVATAR_CACHE_TTL,
+            max_size=2000,
         )
 
+        self._started = False
 
-    async def close(
-        self,
-    ) -> None:
+    # ========================================================
+    # START
+    # ========================================================
+
+    async def start(self) -> None:
         """
-        Close the HTTP session and clean the service.
+        HTTP client'ı başlatır.
+
+        Service yaşam döngüsü boyunca tek client kullanılır.
         """
 
-        if self._closed:
-
+        if self._client is not None:
             return
 
-
-        self._closed = True
-
-
-        if self._session is not None:
-
-            try:
-
-                await self._session.close()
-
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to close Roblox HTTP session."
-                )
-
-
-            finally:
-
-                self._session = None
-
-
-        async with self._cache_lock:
-
-            self._cache.clear()
-
-
-        logger.info(
-            "Roblox service closed."
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=5.0,
+                read=self.DEFAULT_TIMEOUT,
+                write=self.DEFAULT_TIMEOUT,
+                pool=5.0,
+            ),
+            limits=httpx.Limits(
+                max_connections=30,
+                max_keepalive_connections=15,
+            ),
+            headers={
+                "User-Agent": "PAG-Bot/1.0",
+                "Accept": "application/json",
+            },
+            follow_redirects=True,
         )
 
+        self._started = True
 
-    async def _request(
-        self,
-        method: str,
-        url: str,
-        *,
-        params: dict[str, Any] | None = None,
-        json: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+        self._log(
+            logging.INFO,
+            "Roblox service started.",
+        )
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
+    async def close(self) -> None:
         """
-        Perform a resilient HTTP request.
-
-        Features:
-
-            - Reusable HTTP session
-            - Timeout handling
-            - Retry handling
-            - Rate-limit handling
-            - JSON validation
-            - Request statistics
+        HTTP client'ı kapatır.
         """
 
-        session = await self._ensure_session()
+        if self._client is None:
+            return
 
+        await self._client.aclose()
 
-        last_exception: Exception | None = None
+        self._client = None
 
+        self._started = False
 
-        for attempt in range(
-            1,
-            self.MAX_RETRIES + 1,
-        ):
+        self._user_cache.clear()
+        self._avatar_cache.clear()
 
-            self._request_count += 1
+        self._log(
+            logging.INFO,
+            "Roblox service closed.",
+        )
 
+    # ========================================================
+    # GET USER BY USERNAME
+    # ========================================================
 
-            try:
-
-                async with session.request(
-                    method,
-                    url,
-                    params=params,
-                    json=json,
-                ) as response:
-
-                    if response.status == 200:
-
-                        data = await response.json()
-
-
-                        self._successful_request_count += 1
-
-
-                        if not isinstance(
-                            data,
-                            dict,
-                        ):
-
-                            raise RobloxAPIError(
-                                "Roblox returned an invalid "
-                                "JSON structure."
-                            )
-
-
-                        return data
-
-
-                    if response.status == 404:
-
-                        raise RobloxUserNotFoundError(
-                            "Roblox resource was not found."
-                        )
-
-
-                    if response.status == 429:
-
-                        retry_after = response.headers.get(
-                            "Retry-After"
-                        )
-
-
-                        if retry_after:
-
-                            try:
-
-                                delay = float(
-                                    retry_after
-                                )
-
-
-                            except ValueError:
-
-                                delay = (
-                                    self.RETRY_DELAY
-                                    * attempt
-                                )
-
-
-                        else:
-
-                            delay = (
-                                self.RETRY_DELAY
-                                * attempt
-                            )
-
-
-                        logger.warning(
-                            "Roblox rate limit encountered. "
-                            "Retrying in %.2f seconds.",
-                            delay,
-                        )
-
-
-                        await asyncio.sleep(
-                            delay
-                        )
-
-
-                        continue
-
-
-                    response_text = await response.text()
-
-
-                    raise RobloxAPIError(
-                        (
-                            f"Roblox API returned "
-                            f"HTTP {response.status}: "
-                            f"{response_text[:500]}"
-                        )
-                    )
-
-
-            except RobloxUserNotFoundError:
-
-                self._failed_request_count += 1
-
-
-                raise
-
-
-            except RobloxAPIError as error:
-
-                last_exception = error
-
-
-                logger.warning(
-                    (
-                        "Roblox API error on attempt "
-                        "%d/%d: %s"
-                    ),
-                    attempt,
-                    self.MAX_RETRIES,
-                    error,
-                )
-
-
-            except asyncio.TimeoutError as error:
-
-                last_exception = error
-
-
-                logger.warning(
-                    (
-                        "Roblox request timed out on "
-                        "attempt %d/%d."
-                    ),
-                    attempt,
-                    self.MAX_RETRIES,
-                )
-
-
-            except aiohttp.ClientError as error:
-
-                last_exception = error
-
-
-                logger.warning(
-                    (
-                        "Roblox network error on "
-                        "attempt %d/%d: %s"
-                    ),
-                    attempt,
-                    self.MAX_RETRIES,
-                    error,
-                )
-
-
-            if attempt < self.MAX_RETRIES:
-
-                await asyncio.sleep(
-                    self.RETRY_DELAY
-                    * attempt
-                )
-
-
-        self._failed_request_count += 1
-
-
-        if isinstance(
-            last_exception,
-            asyncio.TimeoutError,
-        ):
-
-            raise RobloxTimeoutError(
-                "Roblox API request timed out."
-            )
-
-
-        raise RobloxAPIError(
-            "Roblox API request failed after "
-            f"{self.MAX_RETRIES} attempts."
-        ) from last_exception
-
-
-    async def _get_cached(
-        self,
-        key: str,
-    ) -> Any | None:
-        """
-        Retrieve a value from the in-memory cache.
-        """
-
-        async with self._cache_lock:
-
-            cached = self._cache.get(
-                key
-            )
-
-
-            if cached is None:
-
-                return None
-
-
-            created_at, value = cached
-
-
-            if (
-                time.monotonic()
-                - created_at
-                > self.CACHE_TTL
-            ):
-
-                self._cache.pop(
-                    key,
-                    None,
-                )
-
-
-                return None
-
-
-            return value
-
-
-    async def _set_cached(
-        self,
-        key: str,
-        value: Any,
-    ) -> None:
-        """
-        Store a value in the in-memory cache.
-
-        A simple size limit prevents unlimited memory growth.
-        """
-
-        async with self._cache_lock:
-
-            if len(
-                self._cache
-            ) >= self.MAX_CACHE_SIZE:
-
-                oldest_key = min(
-                    self._cache,
-                    key=lambda item: (
-                        self._cache[
-                            item
-                        ][0]
-                    ),
-                )
-
-
-                self._cache.pop(
-                    oldest_key,
-                    None,
-                )
-
-
-            self._cache[
-                key
-            ] = (
-                time.monotonic(),
-                value,
-            )
-
-
-    async def resolve_username(
+    async def get_user_by_username(
         self,
         username: str,
     ) -> RobloxUser:
         """
-        Resolve a Roblox username into a RobloxUser.
-
-        This uses Roblox's username lookup endpoint.
-
-        The returned object is normalized so that the rest of
-        PAG Core does not need to understand the raw API format.
+        Roblox username üzerinden kullanıcı bilgisi alır.
         """
 
         username = username.strip()
 
-
         if not username:
-
-            raise ValueError(
-                "Username cannot be empty."
+            raise RobloxNotFoundError(
+                "Roblox username cannot be empty."
             )
 
-
         cache_key = (
-            f"user:username:{username.lower()}"
+            "username",
+            username.lower(),
         )
 
-
-        cached = await self._get_cached(
-            cache_key
+        cached = self._user_cache.get(
+            cache_key,
         )
-
 
         if cached is not None:
-
             return cached
 
-
-        data = await self._request(
-            "POST",
-            (
-                f"{self.USERS_BASE_URL}"
-                "/v1/usernames/users"
+        response = await self._request(
+            method="POST",
+            url=(
+                f"{self.USERS_API}"
+                "/usernames/users"
             ),
             json={
-
                 "usernames": [
-                    username
+                    username,
                 ],
-
                 "excludeBannedUsers": False,
-
             },
         )
 
-
-        users = data.get(
+        users = response.get(
             "data",
             [],
         )
 
-
         if not users:
-
-            raise RobloxUserNotFoundError(
+            raise RobloxNotFoundError(
                 f"Roblox user not found: {username}"
             )
 
-
         user_data = users[0]
 
-
-        user_id = user_data.get(
-            "id"
+        user = await self.get_user(
+            int(user_data["id"]),
         )
 
-
-        actual_username = user_data.get(
-            "name",
-            username,
-        )
-
-
-        display_name = user_data.get(
-            "displayName",
-            actual_username,
-        )
-
-
-        if user_id is None:
-
-            raise RobloxAPIError(
-                "Roblox returned a user without an ID."
-            )
-
-
-        user = RobloxUser(
-            user_id=int(
-                user_id
-            ),
-
-            username=str(
-                actual_username
-            ),
-
-            display_name=str(
-                display_name
-            ),
-
-            description="",
-
-            created_at=None,
-
-            is_banned=False,
-
-        )
-
-
-        await self._set_cached(
+        self._user_cache.set(
             cache_key,
             user,
         )
 
-
         return user
 
+    # ========================================================
+    # GET USER BY ID
+    # ========================================================
 
-    async def get_user_by_id(
+    async def get_user(
         self,
         user_id: int,
     ) -> RobloxUser:
         """
-        Retrieve detailed information about a Roblox user
-        using their numeric user ID.
+        Roblox user ID üzerinden kullanıcı bilgisi alır.
         """
 
         if user_id <= 0:
-
             raise ValueError(
-                "User ID must be positive."
+                "Roblox user ID must be positive."
             )
 
-
         cache_key = (
-            f"user:id:{user_id}"
+            "user",
+            user_id,
         )
 
-
-        cached = await self._get_cached(
-            cache_key
+        cached = self._user_cache.get(
+            cache_key,
         )
-
 
         if cached is not None:
-
             return cached
 
-
-        data = await self._request(
-            "GET",
-            (
-                f"{self.USERS_BASE_URL}"
-                f"/v1/users/{user_id}"
+        response = await self._request(
+            method="GET",
+            url=(
+                f"{self.USERS_API}"
+                f"/users/{user_id}"
             ),
         )
 
-
-        user = RobloxUser(
-            user_id=int(
-                data.get(
-                    "id",
-                    user_id,
-                )
-            ),
-
-            username=str(
-                data.get(
-                    "name",
-                    "Unknown",
-                )
-            ),
-
-            display_name=str(
-                data.get(
-                    "displayName",
-                    data.get(
-                        "name",
-                        "Unknown",
-                    ),
-                )
-            ),
-
-            description=str(
-                data.get(
-                    "description",
-                    "",
-                )
-                or
-                ""
-            ),
-
-            created_at=data.get(
-                "created",
-            ),
-
-            is_banned=bool(
-                data.get(
-                    "isBanned",
-                    False,
-                )
-            ),
-
+        user = self._parse_user(
+            response,
         )
 
-
-        profile_url = (
-            "https://www.roblox.com/users/"
-            f"{user.user_id}/profile"
-        )
-
-
-        user.profile_url = profile_url
-
-
-        await self._set_cached(
+        self._user_cache.set(
             cache_key,
             user,
         )
 
-
         return user
 
+    # ========================================================
+    # GET MULTIPLE USERS
+    # ========================================================
 
-    async def get_avatar_url(
+    async def get_users(
+        self,
+        user_ids: Iterable[int],
+    ) -> list[RobloxUser]:
+        """
+        Birden fazla kullanıcıyı kontrollü paralel şekilde alır.
+
+        Cache'de olan kullanıcılar için API isteği atılmaz.
+        """
+
+        unique_ids = list(
+            dict.fromkeys(
+                int(user_id)
+                for user_id in user_ids
+            )
+        )
+
+        if not unique_ids:
+            return []
+
+        users: list[RobloxUser] = []
+
+        missing_ids: list[int] = []
+
+        for user_id in unique_ids:
+            cached = self._user_cache.get(
+                (
+                    "user",
+                    user_id,
+                )
+            )
+
+            if cached is not None:
+                users.append(cached)
+
+            else:
+                missing_ids.append(user_id)
+
+        if missing_ids:
+
+            results = await asyncio.gather(
+                *(
+                    self.get_user(user_id)
+                    for user_id in missing_ids
+                ),
+                return_exceptions=True,
+            )
+
+            for result in results:
+
+                if isinstance(
+                    result,
+                    RobloxUser,
+                ):
+                    users.append(result)
+
+                else:
+                    self._log(
+                        logging.WARNING,
+                        "Failed to fetch Roblox user: %s",
+                        result,
+                    )
+
+        return users
+
+    # ========================================================
+    # GET AVATAR
+    # ========================================================
+
+    async def get_avatar(
         self,
         user_id: int,
         *,
         size: str = "420x420",
         format: str = "Png",
-        is_circular: bool = False,
-    ) -> str | None:
+    ) -> RobloxAvatar:
         """
-        Retrieve a Roblox avatar thumbnail URL.
-
-        Default:
-
-            420x420 PNG
-
-        This is suitable for:
-
-            - Discord embeds
-            - Profile cards
-            - Spotlight systems
-            - Leaderboards
+        Bir Roblox kullanıcısının avatar thumbnail'ını alır.
         """
 
         if user_id <= 0:
-
             raise ValueError(
-                "User ID must be positive."
+                "Roblox user ID must be positive."
             )
 
-
         cache_key = (
-            "avatar:"
-            f"{user_id}:"
-            f"{size}:"
-            f"{format}:"
-            f"{is_circular}"
+            user_id,
+            size,
+            format,
         )
 
-
-        cached = await self._get_cached(
-            cache_key
+        cached = self._avatar_cache.get(
+            cache_key,
         )
-
 
         if cached is not None:
-
             return cached
 
-
-        data = await self._request(
-            "GET",
-            (
-                f"{self.THUMBNAILS_BASE_URL}"
-                "/v1/users/avatar-headshot"
+        response = await self._request(
+            method="GET",
+            url=(
+                f"{self.AVATAR_API}"
+                "/users/avatar"
             ),
             params={
-
-                "userIds": str(
-                    user_id
-                ),
-
+                "userIds": str(user_id),
                 "size": size,
-
                 "format": format,
-
-                "isCircular": str(
-                    is_circular
-                ).lower(),
-
+                "isCircular": "false",
             },
         )
 
-
-        results = data.get(
+        data = response.get(
             "data",
             [],
         )
 
-
-        if not results:
-
-            return None
-
-
-        image_url = results[0].get(
-            "imageUrl"
-        )
-
-
-        if image_url:
-
-            await self._set_cached(
-                cache_key,
-                image_url,
+        if not data:
+            raise RobloxNotFoundError(
+                f"Avatar not found: {user_id}"
             )
 
+        avatar_data = data[0]
 
-        return image_url
+        image_url = avatar_data.get(
+            "imageUrl",
+        )
 
+        if not image_url:
+            raise RobloxNotFoundError(
+                f"Avatar URL not found: {user_id}"
+            )
 
-    async def get_user(
+        avatar = RobloxAvatar(
+            user_id=user_id,
+            image_url=image_url,
+        )
+
+        self._avatar_cache.set(
+            cache_key,
+            avatar,
+        )
+
+        return avatar
+
+    # ========================================================
+    # GET MULTIPLE AVATARS
+    # ========================================================
+
+    async def get_avatars(
         self,
-        username: str,
-    ) -> RobloxUser | None:
+        user_ids: Iterable[int],
+        *,
+        size: str = "420x420",
+        format: str = "Png",
+    ) -> list[RobloxAvatar]:
         """
-        Retrieve a complete Roblox user object.
+        Birden fazla avatarı aynı anda alır.
 
-        Flow:
+        Önemli:
+        Roblox thumbnail API'si batch desteklediği için
+        mümkün olduğunda tek API isteği kullanılır.
+        """
 
-            Username
-                |
-                v
-            Resolve username
-                |
-                v
-            User ID
-                |
-                v
-            Detailed profile
-                |
-                v
-            Avatar thumbnail
+        unique_ids = list(
+            dict.fromkeys(
+                int(user_id)
+                for user_id in user_ids
+            )
+        )
+
+        if not unique_ids:
+            return []
+
+        avatars: list[RobloxAvatar] = []
+
+        missing_ids: list[int] = []
+
+        for user_id in unique_ids:
+
+            cached = self._avatar_cache.get(
+                (
+                    user_id,
+                    size,
+                    format,
+                )
+            )
+
+            if cached is not None:
+                avatars.append(cached)
+
+            else:
+                missing_ids.append(user_id)
+
+        if not missing_ids:
+            return avatars
+
+        # Roblox API batch limitlerine takılmamak için
+        # ID'leri parçalara bölüyoruz.
+        chunks = self._chunks(
+            missing_ids,
+            100,
+        )
+
+        results = await asyncio.gather(
+            *(
+                self._get_avatar_batch(
+                    chunk,
+                    size=size,
+                    format=format,
+                )
+                for chunk in chunks
+            ),
+            return_exceptions=True,
+        )
+
+        for result in results:
+
+            if isinstance(
+                result,
+                list,
+            ):
+                avatars.extend(result)
+
+            else:
+                self._log(
+                    logging.WARNING,
+                    "Failed to fetch avatar batch: %s",
+                    result,
+                )
+
+        return avatars
+
+    # ========================================================
+    # AVATAR BATCH
+    # ========================================================
+
+    async def _get_avatar_batch(
+        self,
+        user_ids: list[int],
+        *,
+        size: str,
+        format: str,
+    ) -> list[RobloxAvatar]:
+        """
+        Avatar batch isteği.
+        """
+
+        response = await self._request(
+            method="GET",
+            url=(
+                f"{self.AVATAR_API}"
+                "/users/avatar"
+            ),
+            params=[
+                (
+                    "userIds",
+                    str(user_id),
+                )
+                for user_id in user_ids
+            ]
+            + [
+                (
+                    "size",
+                    size,
+                ),
+                (
+                    "format",
+                    format,
+                ),
+                (
+                    "isCircular",
+                    "false",
+                ),
+            ],
+        )
+
+        avatars: list[RobloxAvatar] = []
+
+        for item in response.get(
+            "data",
+            [],
+        ):
+
+            image_url = item.get(
+                "imageUrl",
+            )
+
+            if not image_url:
+                continue
+
+            avatar = RobloxAvatar(
+                user_id=int(
+                    item["targetId"]
+                ),
+                image_url=image_url,
+            )
+
+            self._avatar_cache.set(
+                (
+                    avatar.user_id,
+                    size,
+                    format,
+                ),
+                avatar,
+            )
+
+            avatars.append(avatar)
+
+        return avatars
+
+    # ========================================================
+    # HTTP REQUEST
+    # ========================================================
+
+    async def _request(
+        self,
+        *,
+        method: str,
+        url: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """
+        Kontrollü HTTP request sistemi.
+
+        Özellikler:
+        - Semaphore
+        - Retry
+        - Timeout
+        - HTTP status kontrolü
+        - JSON kontrolü
+        """
+
+        client = self._get_client()
+
+        async with self._request_semaphore:
+
+            for attempt in range(
+                1,
+                self.MAX_RETRIES + 1,
+            ):
+
+                try:
+
+                    response = await client.request(
+                        method,
+                        url,
+                        **kwargs,
+                    )
+
+                    if response.status_code == 404:
+                        raise RobloxNotFoundError(
+                            "Roblox resource not found."
+                        )
+
+                    if response.status_code == 429:
+
+                        if attempt >= self.MAX_RETRIES:
+                            raise RobloxAPIError(
+                                "Roblox API rate limit reached."
+                            )
+
+                        await asyncio.sleep(
+                            self.RETRY_DELAY
+                            * attempt
+                        )
+
+                        continue
+
+                    response.raise_for_status()
+
+                    try:
+                        return response.json()
+
+                    except ValueError as error:
+                        raise RobloxAPIError(
+                            "Roblox API returned invalid JSON."
+                        ) from error
+
+                except RobloxNotFoundError:
+                    raise
+
+                except RobloxAPIError:
+                    raise
+
+                except (
+                    httpx.TimeoutException,
+                    httpx.NetworkError,
+                    httpx.RemoteProtocolError,
+                ) as error:
+
+                    if attempt >= self.MAX_RETRIES:
+                        raise RobloxAPIError(
+                            "Roblox API request failed after retries."
+                        ) from error
+
+                    await asyncio.sleep(
+                        self.RETRY_DELAY
+                        * attempt
+                    )
+
+                except httpx.HTTPStatusError as error:
+
+                    status_code = (
+                        error.response.status_code
+                    )
+
+                    if (
+                        status_code >= 500
+                        and attempt < self.MAX_RETRIES
+                    ):
+                        await asyncio.sleep(
+                            self.RETRY_DELAY
+                            * attempt
+                        )
+
+                        continue
+
+                    raise RobloxAPIError(
+                        f"Roblox API returned HTTP "
+                        f"{status_code}."
+                    ) from error
+
+                except Exception as error:
+
+                    self._log(
+                        logging.ERROR,
+                        "Unexpected Roblox API error: %s",
+                        error,
+                    )
+
+                    raise RobloxAPIError(
+                        "Unexpected Roblox API error."
+                    ) from error
+
+        raise RobloxAPIError(
+            "Roblox API request failed."
+        )
+
+    # ========================================================
+    # PARSE USER
+    # ========================================================
+
+    @staticmethod
+    def _parse_user(
+        data: dict[str, Any],
+    ) -> RobloxUser:
+        """
+        API response'unu RobloxUser modeline çevirir.
         """
 
         try:
 
-            resolved_user = (
-                await self.resolve_username(
-                    username
-                )
+            return RobloxUser(
+                id=int(
+                    data["id"]
+                ),
+                name=str(
+                    data["name"]
+                ),
+                display_name=str(
+                    data["displayName"]
+                ),
+                description=str(
+                    data.get(
+                        "description",
+                        "",
+                    )
+                ),
+                created=str(
+                    data.get(
+                        "created",
+                        "",
+                    )
+                ),
+                is_banned=bool(
+                    data.get(
+                        "isBanned",
+                        False,
+                    )
+                ),
             )
 
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as error:
 
-        except RobloxUserNotFoundError:
+            raise RobloxAPIError(
+                "Invalid Roblox user response."
+            ) from error
 
-            return None
+    # ========================================================
+    # CLIENT CHECK
+    # ========================================================
 
-
-        user = await self.get_user_by_id(
-            resolved_user.user_id
-        )
-
-
-        avatar_url = await self.get_avatar_url(
-            user.user_id
-        )
-
-
-        user.avatar_url = avatar_url
-
-
-        return user
-
-
-    async def get_profile(
+    def _get_client(
         self,
-        username: str,
-    ) -> RobloxUser | None:
+    ) -> httpx.AsyncClient:
         """
-        Retrieve a complete Roblox profile.
-
-        This method exists as the primary profile-facing
-        service method.
-
-        Future profile systems can extend this method with:
-
-            - Group memberships
-            - Primary group
-            - Badges
-            - Presence
-            - Avatar configuration
-            - Username history
+        Aktif HTTP client'ı döndürür.
         """
 
-        return await self.get_user(
-            username
-        )
+        if (
+            self._client is None
+            or not self._started
+        ):
+            raise RuntimeError(
+                "RobloxService is not started. "
+                "Call 'await service.start()' first."
+            )
 
+        return self._client
 
-    async def search_users(
+    # ========================================================
+    # CHUNKS
+    # ========================================================
+
+    @staticmethod
+    def _chunks(
+        items: list[int],
+        size: int,
+    ) -> list[list[int]]:
+        """
+        Listeyi küçük parçalara böler.
+        """
+
+        return [
+            items[index:index + size]
+            for index in range(
+                0,
+                len(items),
+                size,
+            )
+        ]
+
+    # ========================================================
+    # LOGGER
+    # ========================================================
+
+    def _log(
         self,
-        keyword: str,
-        *,
-        limit: int = 10,
-    ) -> list[RobloxUser]:
-        """
-        Search Roblox users by keyword.
+        level: int,
+        message: str,
+        *args: Any,
+    ) -> None:
 
-        This method is intended for:
-
-            - Autocomplete
-            - Admin tools
-            - Member linking
-            - Search interfaces
-        """
-
-        keyword = keyword.strip()
-
-
-        if not keyword:
-
-            return []
-
-
-        limit = max(
-            1,
-            min(
-                limit,
-                25,
-            ),
-        )
-
-
-        cache_key = (
-            f"search:{keyword.lower()}:"
-            f"{limit}"
-        )
-
-
-        cached = await self._get_cached(
-            cache_key
-        )
-
-
-        if cached is not None:
-
-            return cached
-
-
-        data = await self._request(
-            "GET",
-            (
-                f"{self.USERS_BASE_URL}"
-                "/v1/users/search"
-            ),
-            params={
-
-                "keyword": keyword,
-
-                "limit": limit,
-
-            },
-        )
-
-
-        results = data.get(
-            "data",
-            [],
-        )
-
-
-        users: list[
-            RobloxUser
-        ] = []
-
-
-        for result in results:
-
-            user_id = result.get(
-                "id"
+        if self.logger is not None:
+            self.logger.log(
+                level,
+                message,
+                *args,
             )
-
-
-            if user_id is None:
-
-                continue
-
-
-            users.append(
-                RobloxUser(
-
-                    user_id=int(
-                        user_id
-                    ),
-
-                    username=str(
-                        result.get(
-                            "name",
-                            "Unknown",
-                        )
-                    ),
-
-                    display_name=str(
-                        result.get(
-                            "displayName",
-                            result.get(
-                                "name",
-                                "Unknown",
-                            ),
-                        )
-                    ),
-
-                    description="",
-
-                    created_at=None,
-
-                    is_banned=False,
-
-                )
-            )
-
-
-        await self._set_cached(
-            cache_key,
-            users,
-        )
-
-
-        return users
-
-
-    async def link_account(
-        self,
-        *,
-        discord_id: int,
-        roblox_id: int,
-        roblox_username: str,
-    ) -> dict[str, Any]:
-        """
-        Prepare a Roblox account link operation.
-
-        The actual database persistence will be added when
-        UserRepository is implemented.
-
-        This method is intentionally defined now so that the
-        Cog already has a stable service interface.
-        """
-
-        if discord_id <= 0:
-
-            raise ValueError(
-                "Discord ID must be positive."
-            )
-
-
-        if roblox_id <= 0:
-
-            raise ValueError(
-                "Roblox ID must be positive."
-            )
-
-
-        if not roblox_username.strip():
-
-            raise ValueError(
-                "Roblox username cannot be empty."
-            )
-
-
-        logger.info(
-            (
-                "Roblox account link requested: "
-                "Discord=%s Roblox=%s"
-            ),
-            discord_id,
-            roblox_id,
-        )
-
-
-        return {
-
-            "discord_id": discord_id,
-
-            "roblox_id": roblox_id,
-
-            "roblox_username": (
-                roblox_username
-            ),
-
-            "linked": True,
-
-        }
-
-
-    def get_statistics(
-        self,
-    ) -> dict[str, Any]:
-        """
-        Return service statistics.
-
-        Useful for:
-
-            - /status
-            - Debugging
-            - Monitoring
-            - Future dashboard
-        """
-
-        return {
-
-            "requests": (
-                self._request_count
-            ),
-
-            "successful_requests": (
-                self._successful_request_count
-            ),
-
-            "failed_requests": (
-                self._failed_request_count
-            ),
-
-            "cache_size": len(
-                self._cache
-            ),
-
-            "session_active": (
-                self._session is not None
-                and not self._session.closed
-            ),
-
-            "closed": self._closed,
-
-        }
