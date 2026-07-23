@@ -1,0 +1,3 @@
+"""
+PAG Core Cogs Package
+"""
