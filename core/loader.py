@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Final
 
+import discord
 from discord.ext import commands
 
 
@@ -27,15 +28,30 @@ class CogLoader:
     Cog sırası kontrollüdür.
 
     Örneğin:
-        general
-            ↓
-        verify
+
+        announcement
             ↓
         blacklist
             ↓
-        top-10
+        general
+            ↓
+        profile
+            ↓
+        roblox
+            ↓
+        role-info
             ↓
         say
+            ↓
+        system
+            ↓
+        top-10
+            ↓
+        top10
+            ↓
+        verify
+            ↓
+        write
     """
 
     # ========================================================
@@ -86,6 +102,68 @@ class CogLoader:
         self.logger = logger
 
     # ========================================================
+    # COMMAND TREE RESET
+    # ========================================================
+
+    def reset_command_tree(
+        self,
+    ) -> None:
+        """
+        Discord application command tree'sini temizler.
+
+        Bu işlem özellikle:
+
+            - Önceki bot instance'ından kalan
+              command state'lerini
+
+            - Yeniden başlatma sırasında oluşabilecek
+              duplicate command kayıtlarını
+
+            - Aynı isimli slash command'lerin
+              eski referanslarını
+
+        temizlemek için kullanılır.
+
+        Bu işlem Discord'daki mevcut global komutları
+        doğrudan silmez.
+
+        Sadece mevcut Python process'i içindeki
+        command tree temizlenir.
+        """
+
+        try:
+
+            command_count = len(
+                self.bot.tree.get_commands(),
+            )
+
+            if command_count == 0:
+
+                self.logger.debug(
+                    "Application command tree is already empty.",
+                )
+
+                return
+
+            self.bot.tree.clear_commands(
+                guild=None,
+            )
+
+            self.logger.info(
+                "Application command tree reset. "
+                "Removed %s local command(s).",
+                command_count,
+            )
+
+        except Exception:
+
+            self.logger.exception(
+                "Failed to reset application command tree.",
+            )
+
+            raise
+
+    # ========================================================
     # LOAD ALL
     # ========================================================
 
@@ -95,15 +173,36 @@ class CogLoader:
         """
         Tüm Cog'ları sırayla yükler.
 
-        Bir Cog yüklenemezse exception yeniden
-        yükseltilir ve botun hatalı bir state ile
-        çalışmaya devam etmesi engellenir.
+        Başlamadan önce application command tree
+        temizlenir.
+
+        Böylece bot yeniden başlatıldığında
+        process içindeki eski command state'lerinin
+        yeni Cog'larla çakışması engellenir.
+
+        Bir Cog yüklenemediğinde:
+
+            - Hata loglanır.
+            - Problemli extension mümkünse temizlenir.
+            - Botun tamamen çökmesi engellenir.
+
+        Böylece sağlam Cog'lar çalışmaya devam edebilir.
         """
+
+        # ----------------------------------------------------
+        # COMMAND TREE RESET
+        # ----------------------------------------------------
+
+        self.reset_command_tree()
+
+        # ----------------------------------------------------
+        # LOAD EXTENSIONS
+        # ----------------------------------------------------
 
         for extension in self.COGS:
 
             # ------------------------------------------------
-            # DUPLICATE CHECK
+            # DUPLICATE EXTENSION CHECK
             # ------------------------------------------------
 
             if extension in self.bot.extensions:
@@ -126,6 +225,10 @@ class CogLoader:
                     extension,
                 )
 
+            # ------------------------------------------------
+            # ALREADY LOADED
+            # ------------------------------------------------
+
             except commands.ExtensionAlreadyLoaded:
 
                 self.logger.warning(
@@ -133,32 +236,88 @@ class CogLoader:
                     extension,
                 )
 
+                continue
+
+            # ------------------------------------------------
+            # NOT FOUND
+            # ------------------------------------------------
+
             except commands.ExtensionNotFound:
 
-                self.logger.exception(
+                self.logger.error(
                     "Cog not found: %s",
                     extension,
+                    exc_info=True,
                 )
 
-                raise
+                # Eksik Cog nedeniyle botu çökertme.
+                continue
+
+            # ------------------------------------------------
+            # NO SETUP
+            # ------------------------------------------------
 
             except commands.NoEntryPointError:
 
-                self.logger.exception(
+                self.logger.error(
                     "Cog setup() not found: %s",
                     extension,
+                    exc_info=True,
                 )
 
-                raise
+                # Setup olmayan Cog atlanır.
+                continue
 
-            except commands.ExtensionFailed:
+            # ------------------------------------------------
+            # COMMAND ALREADY REGISTERED
+            # ------------------------------------------------
 
-                self.logger.exception(
+            except commands.ExtensionFailed as error:
+
+                original_error = error.original
+
+                if isinstance(
+                    original_error,
+                    discord.app_commands.CommandAlreadyRegistered,
+                ):
+
+                    self.logger.error(
+                        (
+                            "Duplicate application command "
+                            "detected while loading %s: %s"
+                        ),
+                        extension,
+                        original_error,
+                    )
+
+                    self.logger.warning(
+                        (
+                            "Skipping conflicting Cog: %s. "
+                            "Check duplicate slash command names."
+                        ),
+                        extension,
+                    )
+
+                    # Extension başarısız olduğundan
+                    # normalde discord.py rollback yapar.
+                    #
+                    # Burada botun tamamen kapanmasını
+                    # engelliyoruz.
+                    continue
+
+                self.logger.error(
                     "Cog failed to load: %s",
                     extension,
+                    exc_info=True,
                 )
 
-                raise
+                # Diğer Cog'ların çalışmaya devam
+                # edebilmesi için bu extension atlanır.
+                continue
+
+            # ------------------------------------------------
+            # UNEXPECTED ERROR
+            # ------------------------------------------------
 
             except Exception:
 
@@ -167,7 +326,9 @@ class CogLoader:
                     extension,
                 )
 
-                raise
+                # Tek bir Cog yüzünden tüm botun
+                # kapanmasını engelle.
+                continue
 
     # ========================================================
     # UNLOAD ALL
@@ -219,6 +380,20 @@ class CogLoader:
                     extension,
                 )
 
+        # ----------------------------------------------------
+        # COMMAND TREE RESET
+        # ----------------------------------------------------
+
+        try:
+
+            self.reset_command_tree()
+
+        except Exception:
+
+            self.logger.exception(
+                "Failed to reset command tree during unload.",
+            )
+
     # ========================================================
     # LOADED COG COUNT
     # ========================================================
@@ -235,3 +410,46 @@ class CogLoader:
             extension in self.bot.extensions
             for extension in self.COGS
         )
+
+    # ========================================================
+    # LOADED COGS
+    # ========================================================
+
+    def loaded_cogs(
+        self,
+    ) -> tuple[str, ...]:
+        """
+        Aktif olarak yüklenmiş Cog'ların isimlerini
+        tuple olarak döndürür.
+        """
+
+        return tuple(
+            extension
+            for extension in self.COGS
+            if extension in self.bot.extensions
+        )
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def status(
+        self,
+    ) -> dict[str, object]:
+        """
+        Loader durumunu döndürür.
+
+        Health/status sistemleri tarafından
+        kullanılabilir.
+        """
+
+        loaded = self.loaded_cogs()
+
+        return {
+            "total": len(self.COGS),
+            "loaded": len(loaded),
+            "extensions": loaded,
+            "commands": len(
+                self.bot.tree.get_commands(),
+            ),
+        }
