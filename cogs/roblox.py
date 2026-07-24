@@ -1,1304 +1,1558 @@
-"""
-PAG Core
-Roblox Integration Cog
-
-This module provides Discord commands for interacting with
-Roblox-related PAG Core systems.
-
-The Cog is responsible for:
-
-    - Receiving Discord commands
-    - Validating user input
-    - Calling the Roblox service layer
-    - Formatting responses
-    - Handling user-facing errors
-
-The Cog is intentionally not responsible for making direct
-Roblox API requests.
-
-Architecture:
-
-    Discord User
-        |
-        v
-    /roblox
-        |
-        v
-    RobloxCog
-        |
-        v
-    RobloxService
-        |
-        v
-    Roblox API
-        |
-        v
-    Roblox Data
-        |
-        v
-    Discord Response
-
-
-Future systems depending on this Cog:
-
-    - Member Profiles
-    - Role Info
-    - Top 10
-    - Member Spotlight
-    - Roblox Account Linking
-    - Roblox Avatar Display
-"""
-
-
 from __future__ import annotations
 
-
-from typing import Any
-
+import logging
+from typing import Iterable
 
 import discord
-
-
 from discord import app_commands
-
-
 from discord.ext import commands
 
-
-from config.constants import (
-    BOT_NAME,
-    BOT_VERSION,
+from services.roblox_service import (
+    RobloxAPIError,
+    RobloxAvatar,
+    RobloxNotFoundError,
+    RobloxService,
+    RobloxUser,
 )
 
 
-from core.logger import logger
-
-
-class RobloxCog(commands.Cog):
+class Roblox(commands.GroupCog, group_name="roblox"):
     """
-    Roblox integration commands for PAG Core.
+    PAG Roblox komutları.
 
-    This Cog acts as the Discord-facing layer of the Roblox
-    integration system.
+    Public:
+        /roblox user
+        /roblox id
+        /roblox avatar
+        /roblox search
+        /roblox batch
+        /roblox avatars
 
-    The Cog should not directly contain:
-
-        - HTTP requests
-        - Roblox API URLs
-        - API response parsing
-        - Cache implementation
-        - Database queries
-
-    Those responsibilities belong to:
-
-        services/roblox_service.py
-
-        database/repositories/user_repository.py
+    Admin:
+        /roblox admin user
+        /roblox admin avatar
+        /roblox admin batch
+        /roblox admin avatars
     """
-
 
     def __init__(
         self,
         bot: commands.Bot,
+        *,
+        roblox_service: RobloxService,
+        logger: logging.Logger,
     ) -> None:
-        """
-        Initialize the Roblox Cog.
-
-        The bot instance is stored so that the Cog can access
-        shared application services in the future.
-        """
-
         self.bot = bot
+        self.roblox_service = roblox_service
+        self.logger = logger
 
-
-        self.service: Any = None
-
-
-        self._service_initialized: bool = False
-
-
-        logger.info(
-            "RobloxCog initialized."
+        self.admin = RobloxAdmin(
+            roblox_service=roblox_service,
+            logger=logger,
         )
 
-
-    async def cog_load(self) -> None:
-        """
-        Prepare the Roblox Cog after it has been loaded.
-
-        The actual RobloxService will be connected here once
-        services/roblox_service.py has been created.
-
-        Keeping this lifecycle hook now allows the service to be
-        introduced later without changing the Cog architecture.
-        """
-
-        logger.info(
-            "Preparing Roblox integration."
-        )
-
-
-        try:
-
-            from services.roblox_service import (
-                RobloxService,
-            )
-
-
-            self.service = RobloxService()
-
-
-            self._service_initialized = True
-
-
-            logger.info(
-                "Roblox service initialized."
-            )
-
-
-        except ModuleNotFoundError:
-
-            self._service_initialized = False
-
-
-            logger.warning(
-                "Roblox service is not available yet."
-            )
-
-
-            logger.warning(
-                "Roblox commands will remain unavailable "
-                "until RobloxService is implemented."
-            )
-
-
-        except Exception:
-
-            self._service_initialized = False
-
-
-            logger.exception(
-                "Failed to initialize Roblox service."
-            )
-
-
-    async def cog_unload(self) -> None:
-        """
-        Clean up the Roblox Cog.
-
-        If the service later owns an HTTP client session,
-        its close method will be called here.
-        """
-
-        if self.service is None:
-
-            return
-
-
-        close_method = getattr(
-            self.service,
-            "close",
-            None,
-        )
-
-
-        if close_method is None:
-
-            return
-
-
-        try:
-
-            result = close_method()
-
-
-            if result is not None:
-
-                await result
-
-
-        except Exception:
-
-            logger.exception(
-                "Failed to close Roblox service."
-            )
-
+    # ========================================================
+    # HELPERS
+    # ========================================================
 
     @staticmethod
-    def _create_error_embed(
+    def _error(
         title: str,
         description: str,
     ) -> discord.Embed:
         """
-        Create a consistent error embed.
-
-        Keeping error formatting centralized ensures that all
-        Roblox commands use the same visual language.
+        Hata embed'i.
         """
 
         return discord.Embed(
             title=title,
             description=description,
             color=discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
         )
 
-
     @staticmethod
-    def _create_info_embed(
+    def _info(
         title: str,
         description: str,
     ) -> discord.Embed:
         """
-        Create a consistent informational embed.
+        Bilgi embed'i.
         """
 
         return discord.Embed(
             title=title,
             description=description,
             color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
         )
 
-
     @staticmethod
-    def _create_success_embed(
+    def _success(
         title: str,
         description: str,
     ) -> discord.Embed:
         """
-        Create a consistent success embed.
+        Başarılı işlem embed'i.
         """
 
         return discord.Embed(
             title=title,
             description=description,
             color=discord.Color.green(),
+            timestamp=discord.utils.utcnow(),
         )
 
-
-    def _service_available(self) -> bool:
+    @staticmethod
+    def _user_profile_url(
+        user_id: int,
+    ) -> str:
         """
-        Check whether the Roblox service is currently available.
-
-        This prevents commands from crashing if the service has
-        not yet been implemented or could not be initialized.
+        Roblox profil URL'si.
         """
 
         return (
-            self.service is not None
-            and self._service_initialized
+            "https://www.roblox.com/users/"
+            f"{user_id}/profile"
         )
-
-
-    async def _send_service_unavailable(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        """
-        Send a user-friendly service-unavailable response.
-        """
-
-        embed = self._create_error_embed(
-            title="Roblox Integration Unavailable",
-            description=(
-                "The Roblox integration is currently "
-                "unavailable.\n\n"
-                "The service may still be initializing "
-                "or temporarily unavailable."
-            ),
-        )
-
-
-        await interaction.response.send_message(
-            embed=embed,
-            ephemeral=True,
-        )
-
 
     @staticmethod
-    def _clean_username(
-        username: str,
+    def _format_date(
+        value: str,
     ) -> str:
         """
-        Clean and normalize a Roblox username.
-
-        The command layer performs basic input normalization.
-
-        Deeper validation belongs to the service layer.
+        Tarih bilgisini güvenli şekilde formatlar.
         """
 
-        return username.strip()
+        if not value:
+            return "Bilinmiyor"
 
+        return value[:100]
 
     @staticmethod
-    def _validate_username(
-        username: str,
-    ) -> bool:
+    def _parse_id_list(
+        value: str,
+        *,
+        limit: int = 25,
+    ) -> list[int]:
         """
-        Perform basic username validation.
+        Virgül veya boşluk ile ayrılmış ID listesini parse eder.
 
-        This is intentionally lightweight.
+        Örnek:
 
-        The Roblox service remains responsible for determining
-        whether the username actually exists.
-        """
+            123, 456, 789
 
-        if not username:
+        veya:
 
-            return False
-
-
-        if len(username) > 20:
-
-            return False
-
-
-        return True
-
-
-    @staticmethod
-    def _get_data_value(
-        data: Any,
-        key: str,
-        default: Any = None,
-    ) -> Any:
-        """
-        Safely retrieve a value from a service response.
-
-        Supports both:
-
-            dictionaries
-
-        and:
-
-            objects with attributes
-
-        This allows the service layer to evolve from raw
-        dictionaries into structured response objects later.
+            123 456 789
         """
 
-        if data is None:
+        raw_items = (
+            value
+            .replace(",", " ")
+            .split()
+        )
 
-            return default
-
-
-        if isinstance(
-            data,
-            dict,
-        ):
-
-            return data.get(
-                key,
-                default,
+        if not raw_items:
+            raise ValueError(
+                "En az bir Roblox User ID gerekli.",
             )
 
+        if len(raw_items) > limit:
+            raise ValueError(
+                f"En fazla {limit} adet ID kullanılabilir.",
+            )
 
-        return getattr(
-            data,
-            key,
-            default,
+        user_ids: list[int] = []
+
+        for item in raw_items:
+            try:
+                user_id = int(item)
+
+            except ValueError as error:
+                raise ValueError(
+                    f"Geçersiz Roblox User ID: {item}",
+                ) from error
+
+            if user_id <= 0:
+                raise ValueError(
+                    "Roblox User ID pozitif olmalıdır.",
+                )
+
+            user_ids.append(user_id)
+
+        return list(
+            dict.fromkeys(user_ids),
         )
 
-
+    @staticmethod
     def _build_user_embed(
-        self,
-        data: Any,
+        user: RobloxUser,
+        *,
+        avatar: RobloxAvatar | None = None,
+        detailed: bool = False,
     ) -> discord.Embed:
         """
-        Build a visually clean Roblox user information embed.
-
-        The method intentionally accepts flexible service data
-        so that the RobloxService can later return a structured
-        dataclass instead of a raw dictionary.
+        RobloxUser modelini Discord embed'ine çevirir.
         """
-
-        username = self._get_data_value(
-            data,
-            "username",
-            "Unknown",
-        )
-
-
-        display_name = self._get_data_value(
-            data,
-            "display_name",
-            username,
-        )
-
-
-        user_id = self._get_data_value(
-            data,
-            "user_id",
-            "Unknown",
-        )
-
-
-        description = self._get_data_value(
-            data,
-            "description",
-            None,
-        )
-
-
-        avatar_url = self._get_data_value(
-            data,
-            "avatar_url",
-            None,
-        )
-
-
-        profile_url = (
-            f"https://www.roblox.com/users/"
-            f"{user_id}/profile"
-            if user_id != "Unknown"
-            else
-            None
-        )
-
 
         embed = discord.Embed(
             title=(
-                f"{display_name}"
-                if display_name != username
-                else
-                username
+                f"👤 {user.display_name}"
             ),
             description=(
-                f"**@{username}**"
+                f"**@{user.name}**"
+            ),
+            url=(
+                "https://www.roblox.com/users/"
+                f"{user.id}/profile"
             ),
             color=discord.Color.blurple(),
-            url=profile_url,
+            timestamp=discord.utils.utcnow(),
         )
-
 
         embed.add_field(
             name="Username",
-            value=f"`{username}`",
+            value=f"`{user.name}`",
             inline=True,
         )
 
+        embed.add_field(
+            name="Display Name",
+            value=f"`{user.display_name}`",
+            inline=True,
+        )
 
         embed.add_field(
             name="User ID",
-            value=f"`{user_id}`",
+            value=f"`{user.id}`",
             inline=True,
         )
 
-
-        if display_name != username:
-
-            embed.add_field(
-                name="Display Name",
-                value=f"`{display_name}`",
-                inline=True,
-            )
-
-
-        if description:
-
-            shortened_description = str(
-                description
-            )
-
-
-            if len(
-                shortened_description
-            ) > 1024:
-
-                shortened_description = (
-                    shortened_description[
-                        :1021
-                    ]
-                    + "..."
-                )
-
-
-            embed.add_field(
-                name="Description",
-                value=shortened_description,
-                inline=False,
-            )
-
-
-        if avatar_url:
-
-            embed.set_thumbnail(
-                url=avatar_url
-            )
-
-
-        embed.set_footer(
-            text=(
-                f"{BOT_NAME} • "
-                f"Roblox Integration • "
-                f"v{BOT_VERSION}"
-            ),
-        )
-
-
-        return embed
-
-
-    @app_commands.command(
-        name="roblox",
-        description=(
-            "Look up a Roblox user."
-        ),
-    )
-    @app_commands.describe(
-        username=(
-            "The Roblox username to search for."
-        ),
-    )
-    async def roblox(
-        self,
-        interaction: discord.Interaction,
-        username: str,
-    ) -> None:
-        """
-        Look up a Roblox user by username.
-
-        Example:
-
-            /roblox username:Builderman
-        """
-
-        username = self._clean_username(
-            username
-        )
-
-
-        if not self._validate_username(
-            username
-        ):
-
-            embed = self._create_error_embed(
-                title="Invalid Username",
-                description=(
-                    "Please enter a valid Roblox "
-                    "username."
-                ),
-            )
-
-
-            await interaction.response.send_message(
-                embed=embed,
-                ephemeral=True,
-            )
-
-
-            return
-
-
-        if not self._service_available():
-
-            await self._send_service_unavailable(
-                interaction
-            )
-
-
-            return
-
-
-        await interaction.response.defer()
-
-
-        try:
-
-            data = await self.service.get_user(
-                username
-            )
-
-
-        except Exception:
-
-            logger.exception(
-                "Roblox user lookup failed: %s",
-                username,
-            )
-
-
-            embed = self._create_error_embed(
-                title="Roblox Lookup Failed",
-                description=(
-                    "An error occurred while retrieving "
-                    "this Roblox user."
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed
-            )
-
-
-            return
-
-
-        if data is None:
-
-            embed = self._create_error_embed(
-                title="User Not Found",
-                description=(
-                    f"No Roblox user was found for:\n"
-                    f"`{username}`"
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed
-            )
-
-
-            return
-
-
-        embed = self._build_user_embed(
-            data
-        )
-
-
-        await interaction.followup.send(
-            embed=embed
-        )
-
-
-    @app_commands.command(
-        name="roblox-avatar",
-        description=(
-            "Display a Roblox user's avatar."
-        ),
-    )
-    @app_commands.describe(
-        username=(
-            "The Roblox username to look up."
-        ),
-    )
-    async def roblox_avatar(
-        self,
-        interaction: discord.Interaction,
-        username: str,
-    ) -> None:
-        """
-        Display a Roblox avatar thumbnail.
-
-        The thumbnail itself is retrieved by the service layer.
-        """
-
-        username = self._clean_username(
-            username
-        )
-
-
-        if not self._validate_username(
-            username
-        ):
-
-            embed = self._create_error_embed(
-                title="Invalid Username",
-                description=(
-                    "Please enter a valid Roblox "
-                    "username."
-                ),
-            )
-
-
-            await interaction.response.send_message(
-                embed=embed,
-                ephemeral=True,
-            )
-
-
-            return
-
-
-        if not self._service_available():
-
-            await self._send_service_unavailable(
-                interaction
-            )
-
-
-            return
-
-
-        await interaction.response.defer()
-
-
-        try:
-
-            data = await self.service.get_user(
-                username
-            )
-
-
-        except Exception:
-
-            logger.exception(
-                "Roblox avatar lookup failed: %s",
-                username,
-            )
-
-
-            embed = self._create_error_embed(
-                title="Avatar Lookup Failed",
-                description=(
-                    "The Roblox avatar could not "
-                    "be retrieved."
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed
-            )
-
-
-            return
-
-
-        if data is None:
-
-            embed = self._create_error_embed(
-                title="User Not Found",
-                description=(
-                    f"No Roblox user was found for:\n"
-                    f"`{username}`"
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed
-            )
-
-
-            return
-
-
-        actual_username = self._get_data_value(
-            data,
-            "username",
-            username,
-        )
-
-
-        display_name = self._get_data_value(
-            data,
-            "display_name",
-            actual_username,
-        )
-
-
-        user_id = self._get_data_value(
-            data,
-            "user_id",
-            None,
-        )
-
-
-        avatar_url = self._get_data_value(
-            data,
-            "avatar_url",
-            None,
-        )
-
-
-        embed = discord.Embed(
-            title=display_name,
-            description=(
-                f"Roblox avatar of "
-                f"**{actual_username}**"
-            ),
-            color=discord.Color.blurple(),
-        )
-
-
-        if avatar_url:
-
-            embed.set_image(
-                url=avatar_url
-            )
-
-
-        if user_id is not None:
-
-            embed.add_field(
-                name="User ID",
-                value=f"`{user_id}`",
-                inline=True,
-            )
-
-
-        embed.set_footer(
-            text=(
-                f"{BOT_NAME} • "
-                f"Roblox Avatar System"
-            ),
-        )
-
-
-        await interaction.followup.send(
-            embed=embed
-        )
-
-
-    @app_commands.command(
-        name="roblox-profile",
-        description=(
-            "Display a detailed Roblox profile."
-        ),
-    )
-    @app_commands.describe(
-        username=(
-            "The Roblox username to look up."
-        ),
-    )
-    async def roblox_profile(
-        self,
-        interaction: discord.Interaction,
-        username: str,
-    ) -> None:
-        """
-        Display an expanded Roblox profile.
-
-        This command is designed to become the foundation
-        for the future PAG member profile system.
-        """
-
-        username = self._clean_username(
-            username
-        )
-
-
-        if not self._validate_username(
-            username
-        ):
-
-            embed = self._create_error_embed(
-                title="Invalid Username",
-                description=(
-                    "Please enter a valid Roblox "
-                    "username."
-                ),
-            )
-
-
-            await interaction.response.send_message(
-                embed=embed,
-                ephemeral=True,
-            )
-
-
-            return
-
-
-        if not self._service_available():
-
-            await self._send_service_unavailable(
-                interaction
-            )
-
-
-            return
-
-
-        await interaction.response.defer()
-
-
-        try:
-
-            data = await self.service.get_profile(
-                username
-            )
-
-
-        except AttributeError:
-
-            logger.warning(
-                "RobloxService does not yet implement "
-                "get_profile()."
-            )
-
-
-            try:
-
-                data = await self.service.get_user(
-                    username
-                )
-
-
-            except Exception:
-
-                logger.exception(
-                    "Fallback Roblox lookup failed."
-                )
-
-
-                embed = self._create_error_embed(
-                    title="Profile Unavailable",
-                    description=(
-                        "The Roblox profile service "
-                        "is not ready yet."
-                    ),
-                )
-
-
-                await interaction.followup.send(
-                    embed=embed
-                )
-
-
-                return
-
-
-        except Exception:
-
-            logger.exception(
-                "Roblox profile lookup failed: %s",
-                username,
-            )
-
-
-            embed = self._create_error_embed(
-                title="Profile Lookup Failed",
-                description=(
-                    "An error occurred while retrieving "
-                    "the Roblox profile."
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed
-            )
-
-
-            return
-
-
-        if data is None:
-
-            embed = self._create_error_embed(
-                title="User Not Found",
-                description=(
-                    f"No Roblox user was found for:\n"
-                    f"`{username}`"
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed
-            )
-
-
-            return
-
-
-        embed = self._build_user_embed(
-            data
-        )
-
-
-        created_at = self._get_data_value(
-            data,
-            "created_at",
-            None,
-        )
-
-
-        is_banned = self._get_data_value(
-            data,
-            "is_banned",
-            None,
-        )
-
-
-        if created_at:
-
+        if detailed:
             embed.add_field(
                 name="Account Created",
-                value=str(
-                    created_at
+                value=(
+                    f"`{user.created}`"
+                    if user.created
+                    else "Bilinmiyor"
                 ),
-                inline=True,
+                inline=False,
             )
-
-
-        if is_banned is not None:
 
             embed.add_field(
                 name="Account Status",
                 value=(
-                    "Banned"
-                    if is_banned
-                    else
-                    "Active"
+                    "🔴 Banned"
+                    if user.is_banned
+                    else "🟢 Active"
                 ),
                 inline=True,
             )
 
+        if user.description:
+            description = user.description
 
-        await interaction.followup.send(
-            embed=embed
+            if len(description) > 1024:
+                description = (
+                    description[:1021]
+                    + "..."
+                )
+
+            embed.add_field(
+                name="Description",
+                value=description,
+                inline=False,
+            )
+
+        if avatar is not None:
+            embed.set_thumbnail(
+                url=avatar.image_url,
+            )
+
+        return embed
+
+    @staticmethod
+    def _build_avatar_embed(
+        user: RobloxUser,
+        avatar: RobloxAvatar,
+    ) -> discord.Embed:
+        """
+        Avatar embed'i.
+        """
+
+        embed = discord.Embed(
+            title=(
+                f"🧍 {user.display_name}"
+            ),
+            description=(
+                f"**@{user.name}**\n"
+                f"Roblox User ID: `{user.id}`"
+            ),
+            url=(
+                "https://www.roblox.com/users/"
+                f"{user.id}/profile"
+            ),
+            color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
         )
 
+        embed.set_image(
+            url=avatar.image_url,
+        )
+
+        embed.set_footer(
+            text=(
+                "PAG Roblox Service"
+            ),
+        )
+
+        return embed
+
+    @staticmethod
+    def _build_user_list_embed(
+        users: Iterable[RobloxUser],
+        *,
+        title: str,
+    ) -> discord.Embed:
+        """
+        Kullanıcı listesini embed'e çevirir.
+        """
+
+        users = list(users)
+
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        if not users:
+            embed.description = (
+                "Hiçbir Roblox kullanıcısı bulunamadı."
+            )
+
+            return embed
+
+        lines: list[str] = []
+
+        for index, user in enumerate(
+            users,
+            start=1,
+        ):
+            lines.append(
+                f"**{index}.** "
+                f"[{user.display_name}]"
+                f"({Roblox._user_profile_url(user.id)}) "
+                f"`@{user.name}` "
+                f"`{user.id}`"
+            )
+
+        description = "\n".join(
+            lines,
+        )
+
+        if len(description) > 4000:
+            description = (
+                description[:3997]
+                + "..."
+            )
+
+        embed.description = description
+
+        embed.set_footer(
+            text=(
+                f"{len(users)} kullanıcı bulundu."
+            ),
+        )
+
+        return embed
+
+    # ========================================================
+    # USER
+    # ========================================================
 
     @app_commands.command(
-        name="roblox-link",
-        description=(
-            "Link a Roblox account to your PAG profile."
-        ),
+        name="user",
+        description="Roblox kullanıcı adından profil bilgisi getirir.",
     )
     @app_commands.describe(
-        username=(
-            "The Roblox username to link."
-        ),
+        username="Roblox kullanıcı adı.",
     )
-    async def roblox_link(
+    async def user(
         self,
         interaction: discord.Interaction,
         username: str,
     ) -> None:
         """
-        Link a Roblox account to a Discord user.
-
-        The actual database operation will be implemented
-        through the service and repository layers.
-
-        This command is currently prepared as the public
-        interface for the future account-linking system.
+        Username üzerinden Roblox kullanıcı arar.
         """
 
-        username = self._clean_username(
-            username
-        )
+        username = username.strip()
 
-
-        if not self._validate_username(
-            username
-        ):
-
-            embed = self._create_error_embed(
-                title="Invalid Username",
-                description=(
-                    "Please enter a valid Roblox "
-                    "username."
-                ),
-            )
-
-
+        if not username:
             await interaction.response.send_message(
-                embed=embed,
+                embed=self._error(
+                    "❌ Geçersiz Kullanıcı Adı",
+                    (
+                        "Roblox kullanıcı adı boş bırakılamaz."
+                    ),
+                ),
                 ephemeral=True,
             )
 
-
             return
 
-
-        if not self._service_available():
-
-            await self._send_service_unavailable(
-                interaction
-            )
-
-
-            return
-
-
-        await interaction.response.defer(
-            ephemeral=True
-        )
-
+        await interaction.response.defer()
 
         try:
-
-            user_data = await self.service.get_user(
-                username
+            user = (
+                await self.roblox_service
+                .get_user_by_username(
+                    username,
+                )
             )
 
+        except RobloxNotFoundError:
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Kullanıcı Bulunamadı",
+                    (
+                        f"`{username}` adlı Roblox "
+                        "kullanıcısı bulunamadı."
+                    ),
+                ),
+            )
+
+            return
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Roblox username lookup failed: %s",
+                username,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Roblox API'sine erişilirken "
+                        "bir hata oluştu."
+                    ),
+                ),
+            )
+
+            return
 
         except Exception:
-
-            logger.exception(
-                "Roblox account linking lookup failed."
+            self.logger.exception(
+                "Unexpected Roblox username error: %s",
+                username,
             )
 
-
-            embed = self._create_error_embed(
-                title="Account Linking Failed",
-                description=(
-                    "The Roblox account could not "
-                    "be verified."
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Beklenmeyen Hata",
+                    (
+                        "Roblox kullanıcısı aranırken "
+                        "beklenmeyen bir hata oluştu."
+                    ),
                 ),
             )
 
-
-            await interaction.followup.send(
-                embed=embed,
-                ephemeral=True,
-            )
-
-
             return
 
+        avatar: RobloxAvatar | None = None
 
-        if user_data is None:
-
-            embed = self._create_error_embed(
-                title="Roblox User Not Found",
-                description=(
-                    "The Roblox username could not "
-                    "be found."
-                ),
+        try:
+            avatar = (
+                await self.roblox_service
+                .get_avatar(
+                    user.id,
+                )
             )
 
-
-            await interaction.followup.send(
-                embed=embed,
-                ephemeral=True,
+        except RobloxNotFoundError:
+            self.logger.warning(
+                "Avatar not found for user: %s",
+                user.id,
             )
 
+        except RobloxAPIError:
+            self.logger.warning(
+                "Avatar API failed for user: %s",
+                user.id,
+            )
 
-            return
-
-
-        user_id = self._get_data_value(
-            user_data,
-            "user_id",
-            None,
+        embed = self._build_user_embed(
+            user,
+            avatar=avatar,
+            detailed=True,
         )
 
+        await interaction.followup.send(
+            embed=embed,
+        )
 
-        actual_username = self._get_data_value(
-            user_data,
-            "username",
+    # ========================================================
+    # ID
+    # ========================================================
+
+    @app_commands.command(
+        name="id",
+        description="Roblox User ID üzerinden kullanıcı bilgisi getirir.",
+    )
+    @app_commands.describe(
+        user_id="Roblox User ID.",
+    )
+    async def user_by_id(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+    ) -> None:
+        """
+        User ID üzerinden Roblox kullanıcı arar.
+        """
+
+        if user_id <= 0:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz User ID",
+                    (
+                        "Roblox User ID pozitif "
+                        "bir sayı olmalıdır."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        await interaction.response.defer()
+
+        try:
+            user = (
+                await self.roblox_service
+                .get_user(
+                    user_id,
+                )
+            )
+
+        except RobloxNotFoundError:
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Kullanıcı Bulunamadı",
+                    (
+                        f"`{user_id}` ID'sine sahip "
+                        "Roblox kullanıcısı bulunamadı."
+                    ),
+                ),
+            )
+
+            return
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Roblox ID lookup failed: %s",
+                user_id,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Roblox API'sinden kullanıcı "
+                        "bilgisi alınamadı."
+                    ),
+                ),
+            )
+
+            return
+
+        except Exception:
+            self.logger.exception(
+                "Unexpected Roblox ID lookup error: %s",
+                user_id,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Beklenmeyen Hata",
+                    (
+                        "Kullanıcı bilgisi alınırken "
+                        "beklenmeyen bir hata oluştu."
+                    ),
+                ),
+            )
+
+            return
+
+        avatar: RobloxAvatar | None = None
+
+        try:
+            avatar = (
+                await self.roblox_service
+                .get_avatar(
+                    user.id,
+                )
+            )
+
+        except (
+            RobloxNotFoundError,
+            RobloxAPIError,
+        ):
+            pass
+
+        embed = self._build_user_embed(
+            user,
+            avatar=avatar,
+            detailed=True,
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+        )
+
+    # ========================================================
+    # AVATAR
+    # ========================================================
+
+    @app_commands.command(
+        name="avatar",
+        description="Bir Roblox kullanıcısının avatarını gösterir.",
+    )
+    @app_commands.describe(
+        username="Roblox kullanıcı adı.",
+    )
+    async def avatar(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+    ) -> None:
+        """
+        Roblox avatarını gösterir.
+        """
+
+        username = username.strip()
+
+        if not username:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz Kullanıcı Adı",
+                    (
+                        "Roblox kullanıcı adı boş bırakılamaz."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        await interaction.response.defer()
+
+        try:
+            user = (
+                await self.roblox_service
+                .get_user_by_username(
+                    username,
+                )
+            )
+
+            avatar = (
+                await self.roblox_service
+                .get_avatar(
+                    user.id,
+                )
+            )
+
+        except RobloxNotFoundError:
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Avatar Bulunamadı",
+                    (
+                        "Kullanıcı veya avatar "
+                        "bulunamadı."
+                    ),
+                ),
+            )
+
+            return
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Roblox avatar lookup failed: %s",
+                username,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Avatar alınırken Roblox API "
+                        "hatası oluştu."
+                    ),
+                ),
+            )
+
+            return
+
+        except Exception:
+            self.logger.exception(
+                "Unexpected Roblox avatar error: %s",
+                username,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Beklenmeyen Hata",
+                    (
+                        "Avatar alınırken beklenmeyen "
+                        "bir hata oluştu."
+                    ),
+                ),
+            )
+
+            return
+
+        embed = self._build_avatar_embed(
+            user,
+            avatar,
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+        )
+
+    # ========================================================
+    # SEARCH
+    # ========================================================
+
+    @app_commands.command(
+        name="search",
+        description="Roblox kullanıcı adıyla kullanıcı bilgisi arar.",
+    )
+    @app_commands.describe(
+        username="Aranacak Roblox kullanıcı adı.",
+    )
+    async def search(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+    ) -> None:
+        """
+        User komutunun daha basit arama versiyonu.
+        """
+
+        await self.user(
+            interaction,
             username,
         )
 
+    # ========================================================
+    # BATCH
+    # ========================================================
 
-        if user_id is None:
-
-            embed = self._create_error_embed(
-                title="Invalid Roblox Data",
-                description=(
-                    "Roblox returned incomplete "
-                    "user information."
-                ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed,
-                ephemeral=True,
-            )
-
-
-            return
-
+    @app_commands.command(
+        name="batch",
+        description="Birden fazla Roblox User ID'sini sorgular.",
+    )
+    @app_commands.describe(
+        user_ids=(
+            "Virgül veya boşluk ile ayrılmış "
+            "Roblox User ID'leri."
+        ),
+    )
+    async def batch(
+        self,
+        interaction: discord.Interaction,
+        user_ids: str,
+    ) -> None:
+        """
+        Birden fazla Roblox kullanıcısını sorgular.
+        """
 
         try:
-
-            link_method = getattr(
-                self.service,
-                "link_account",
-                None,
+            parsed_ids = self._parse_id_list(
+                user_ids,
+                limit=25,
             )
 
-
-            if link_method is None:
-
-                embed = self._create_info_embed(
-                    title="Account Linking Prepared",
-                    description=(
-                        "The Roblox account was found, "
-                        "but the database linking system "
-                        "is not implemented yet."
-                    ),
-                )
-
-
-                embed.add_field(
-                    name="Roblox Username",
-                    value=(
-                        f"`{actual_username}`"
-                    ),
-                    inline=True,
-                )
-
-
-                embed.add_field(
-                    name="Roblox User ID",
-                    value=f"`{user_id}`",
-                    inline=True,
-                )
-
-
-                await interaction.followup.send(
-                    embed=embed,
-                    ephemeral=True,
-                )
-
-
-                return
-
-
-            await link_method(
-                discord_id=interaction.user.id,
-                roblox_id=user_id,
-                roblox_username=actual_username,
-            )
-
-
-        except Exception:
-
-            logger.exception(
-                "Failed to link Roblox account."
-            )
-
-
-            embed = self._create_error_embed(
-                title="Account Linking Failed",
-                description=(
-                    "The Roblox account could not "
-                    "be linked."
+        except ValueError as error:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz ID Listesi",
+                    str(error),
                 ),
-            )
-
-
-            await interaction.followup.send(
-                embed=embed,
                 ephemeral=True,
             )
 
+            return
+
+        await interaction.response.defer()
+
+        try:
+            users = (
+                await self.roblox_service
+                .get_users(
+                    parsed_ids,
+                )
+            )
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Roblox batch user lookup failed.",
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Kullanıcılar sorgulanırken "
+                        "bir API hatası oluştu."
+                    ),
+                ),
+            )
 
             return
 
+        except Exception:
+            self.logger.exception(
+                "Unexpected Roblox batch lookup error.",
+            )
 
-        embed = self._create_success_embed(
-            title="Roblox Account Linked",
-            description=(
-                "Your Roblox account has been "
-                "successfully linked to PAG."
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Beklenmeyen Hata",
+                    (
+                        "Kullanıcılar sorgulanırken "
+                        "beklenmeyen bir hata oluştu."
+                    ),
+                ),
+            )
+
+            return
+
+        embed = self._build_user_list_embed(
+            users,
+            title="👥 Roblox Users",
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+        )
+
+    # ========================================================
+    # AVATARS
+    # ========================================================
+
+    @app_commands.command(
+        name="avatars",
+        description="Birden fazla Roblox avatarını sorgular.",
+    )
+    @app_commands.describe(
+        user_ids=(
+            "Virgül veya boşluk ile ayrılmış "
+            "Roblox User ID'leri."
+        ),
+    )
+    async def avatars(
+        self,
+        interaction: discord.Interaction,
+        user_ids: str,
+    ) -> None:
+        """
+        Birden fazla avatarı kontrollü şekilde alır.
+
+        Not:
+            RobloxService batch avatar desteğini
+            kendi içinde yönetir.
+        """
+
+        try:
+            parsed_ids = self._parse_id_list(
+                user_ids,
+                limit=25,
+            )
+
+        except ValueError as error:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz ID Listesi",
+                    str(error),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        await interaction.response.defer()
+
+        try:
+            avatars = (
+                await self.roblox_service
+                .get_avatars(
+                    parsed_ids,
+                )
+            )
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Roblox batch avatar lookup failed.",
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Avatarlar alınırken "
+                        "bir API hatası oluştu."
+                    ),
+                ),
+            )
+
+            return
+
+        except Exception:
+            self.logger.exception(
+                "Unexpected Roblox batch avatar error.",
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Beklenmeyen Hata",
+                    (
+                        "Avatarlar alınırken "
+                        "beklenmeyen bir hata oluştu."
+                    ),
+                ),
+            )
+
+            return
+
+        if not avatars:
+            await interaction.followup.send(
+                embed=self._info(
+                    "ℹ️ Avatar Bulunamadı",
+                    (
+                        "Verilen ID'ler için avatar "
+                        "bulunamadı."
+                    ),
+                ),
+            )
+
+            return
+
+        user_ids_found = [
+            avatar.user_id
+            for avatar in avatars
+        ]
+
+        users = (
+            await self.roblox_service
+            .get_users(
+                user_ids_found,
+            )
+        )
+
+        user_map = {
+            user.id: user
+            for user in users
+        }
+
+        for avatar in avatars[:10]:
+            user = user_map.get(
+                avatar.user_id,
+            )
+
+            if user is None:
+                continue
+
+            embed = self._build_avatar_embed(
+                user,
+                avatar,
+            )
+
+            await interaction.followup.send(
+                embed=embed,
+            )
+
+    # ========================================================
+    # ERROR HANDLER
+    # ========================================================
+
+    async def cog_app_command_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError,
+    ) -> None:
+        """
+        Roblox command hata yöneticisi.
+        """
+
+        self.logger.error(
+            "Roblox command error: %s",
+            error,
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
             ),
         )
 
-
-        embed.add_field(
-            name="Username",
-            value=f"`{actual_username}`",
-            inline=True,
+        message = (
+            "❌ Roblox komutu çalıştırılırken "
+            "beklenmeyen bir hata oluştu."
         )
 
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                message,
+                ephemeral=True,
+            )
+
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
+
+
+# ============================================================
+# ADMIN COMMANDS
+# ============================================================
+
+
+class RobloxAdmin(
+    app_commands.Group,
+):
+    """
+    Roblox admin komutları.
+
+    Bu grup sadece Administrator yetkisi
+    olan kullanıcılar tarafından kullanılabilir.
+    """
+
+    def __init__(
+        self,
+        *,
+        roblox_service: RobloxService,
+        logger: logging.Logger,
+    ) -> None:
+        super().__init__(
+            name="admin",
+            description="Roblox yönetim komutları.",
+            default_permissions=discord.Permissions(
+                administrator=True,
+            ),
+        )
+
+        self.roblox_service = roblox_service
+        self.logger = logger
+
+    # ========================================================
+    # ADMIN HELPERS
+    # ========================================================
+
+    @staticmethod
+    def _error(
+        title: str,
+        description: str,
+    ) -> discord.Embed:
+        return discord.Embed(
+            title=title,
+            description=description,
+            color=discord.Color.red(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+    @staticmethod
+    def _user_embed(
+        user: RobloxUser,
+        avatar: RobloxAvatar | None = None,
+    ) -> discord.Embed:
+        embed = discord.Embed(
+            title=(
+                f"🛡️ Roblox Admin Lookup"
+            ),
+            description=(
+                f"**{user.display_name}**\n"
+                f"@{user.name}"
+            ),
+            url=(
+                "https://www.roblox.com/users/"
+                f"{user.id}/profile"
+            ),
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow(),
+        )
 
         embed.add_field(
             name="User ID",
-            value=f"`{user_id}`",
+            value=f"`{user.id}`",
             inline=True,
         )
 
+        embed.add_field(
+            name="Username",
+            value=f"`{user.name}`",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Display Name",
+            value=f"`{user.display_name}`",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Created",
+            value=(
+                f"`{user.created}`"
+                if user.created
+                else "Unknown"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Status",
+            value=(
+                "🔴 Banned"
+                if user.is_banned
+                else "🟢 Active"
+            ),
+            inline=True,
+        )
+
+        if user.description:
+            description = user.description
+
+            if len(description) > 1024:
+                description = (
+                    description[:1021]
+                    + "..."
+                )
+
+            embed.add_field(
+                name="Description",
+                value=description,
+                inline=False,
+            )
+
+        if avatar:
+            embed.set_thumbnail(
+                url=avatar.image_url,
+            )
+
+        embed.set_footer(
+            text="PAG Roblox Admin Tools",
+        )
+
+        return embed
+
+    # ========================================================
+    # ADMIN USER
+    # ========================================================
+
+    @app_commands.command(
+        name="user",
+        description="Admin: Roblox kullanıcı bilgilerini görüntüler.",
+    )
+    @app_commands.describe(
+        username="Roblox kullanıcı adı.",
+    )
+    async def user(
+        self,
+        interaction: discord.Interaction,
+        username: str,
+    ) -> None:
+        """
+        Admin kullanıcı sorgusu.
+        """
+
+        await interaction.response.defer(
+            ephemeral=True,
+        )
+
+        try:
+            user = (
+                await self.roblox_service
+                .get_user_by_username(
+                    username.strip(),
+                )
+            )
+
+            avatar = (
+                await self.roblox_service
+                .get_avatar(
+                    user.id,
+                )
+            )
+
+        except RobloxNotFoundError:
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Kullanıcı Bulunamadı",
+                    (
+                        "Roblox kullanıcısı "
+                        "bulunamadı."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Admin Roblox lookup failed: %s",
+                username,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Roblox API'si kullanıcı "
+                        "bilgisi döndüremedi."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        embed = self._user_embed(
+            user,
+            avatar,
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    # ========================================================
+    # ADMIN AVATAR
+    # ========================================================
+
+    @app_commands.command(
+        name="avatar",
+        description="Admin: Roblox avatarı görüntüler.",
+    )
+    @app_commands.describe(
+        user_id="Roblox User ID.",
+    )
+    async def avatar(
+        self,
+        interaction: discord.Interaction,
+        user_id: int,
+    ) -> None:
+        """
+        Admin avatar lookup.
+        """
+
+        if user_id <= 0:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz User ID",
+                    (
+                        "User ID pozitif olmalıdır."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+        )
+
+        try:
+            user = (
+                await self.roblox_service
+                .get_user(
+                    user_id,
+                )
+            )
+
+            avatar = (
+                await self.roblox_service
+                .get_avatar(
+                    user_id,
+                )
+            )
+
+        except RobloxNotFoundError:
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Bulunamadı",
+                    (
+                        "Roblox kullanıcısı veya "
+                        "avatarı bulunamadı."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Admin Roblox avatar lookup failed: %s",
+                user_id,
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Avatar bilgisi alınamadı."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        embed = self._user_embed(
+            user,
+            avatar,
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    # ========================================================
+    # ADMIN BATCH
+    # ========================================================
+
+    @app_commands.command(
+        name="batch",
+        description="Admin: Birden fazla Roblox kullanıcısını sorgular.",
+    )
+    @app_commands.describe(
+        user_ids=(
+            "Virgül veya boşluk ile ayrılmış "
+            "Roblox User ID'leri."
+        ),
+    )
+    async def batch(
+        self,
+        interaction: discord.Interaction,
+        user_ids: str,
+    ) -> None:
+        """
+        Admin batch user lookup.
+        """
+
+        try:
+            parsed_ids = Roblox._parse_id_list(
+                user_ids,
+                limit=100,
+            )
+
+        except ValueError as error:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz ID Listesi",
+                    str(error),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+        )
+
+        try:
+            users = (
+                await self.roblox_service
+                .get_users(
+                    parsed_ids,
+                )
+            )
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Admin Roblox batch lookup failed.",
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Toplu kullanıcı sorgusu "
+                        "başarısız oldu."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        lines: list[str] = []
+
+        for user in users:
+            status = (
+                "🔴 Banned"
+                if user.is_banned
+                else "🟢 Active"
+            )
+
+            lines.append(
+                f"{status} "
+                f"`{user.id}` "
+                f"**{user.display_name}** "
+                f"(`{user.name}`)"
+            )
+
+        if not lines:
+            description = (
+                "Hiçbir kullanıcı bulunamadı."
+            )
+
+        else:
+            description = "\n".join(
+                lines,
+            )
+
+        if len(description) > 4000:
+            description = (
+                description[:3997]
+                + "..."
+            )
+
+        embed = discord.Embed(
+            title="🛡️ Roblox Admin Batch",
+            description=description,
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        embed.set_footer(
+            text=(
+                f"{len(users)} kullanıcı bulundu."
+            ),
+        )
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    # ========================================================
+    # ADMIN AVATARS
+    # ========================================================
+
+    @app_commands.command(
+        name="avatars",
+        description="Admin: Toplu Roblox avatar sorgusu yapar.",
+    )
+    @app_commands.describe(
+        user_ids=(
+            "Virgül veya boşluk ile ayrılmış "
+            "Roblox User ID'leri."
+        ),
+    )
+    async def avatars(
+        self,
+        interaction: discord.Interaction,
+        user_ids: str,
+    ) -> None:
+        """
+        Admin batch avatar lookup.
+        """
+
+        try:
+            parsed_ids = Roblox._parse_id_list(
+                user_ids,
+                limit=100,
+            )
+
+        except ValueError as error:
+            await interaction.response.send_message(
+                embed=self._error(
+                    "❌ Geçersiz ID Listesi",
+                    str(error),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+        )
+
+        try:
+            avatars = (
+                await self.roblox_service
+                .get_avatars(
+                    parsed_ids,
+                )
+            )
+
+        except RobloxAPIError:
+            self.logger.exception(
+                "Admin Roblox batch avatar lookup failed.",
+            )
+
+            await interaction.followup.send(
+                embed=self._error(
+                    "❌ Roblox API Hatası",
+                    (
+                        "Toplu avatar sorgusu "
+                        "başarısız oldu."
+                    ),
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        lines: list[str] = []
+
+        for avatar in avatars:
+            lines.append(
+                f"🖼️ "
+                f"`{avatar.user_id}`\n"
+                f"{avatar.image_url}"
+            )
+
+        if not lines:
+            description = (
+                "Avatar bulunamadı."
+            )
+
+        else:
+            description = "\n\n".join(
+                lines,
+            )
+
+        if len(description) > 4000:
+            description = (
+                description[:3997]
+                + "..."
+            )
+
+        embed = discord.Embed(
+            title="🛡️ Roblox Admin Avatars",
+            description=description,
+            color=discord.Color.orange(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        embed.set_footer(
+            text=(
+                f"{len(avatars)} avatar bulundu."
+            ),
+        )
 
         await interaction.followup.send(
             embed=embed,
@@ -1306,113 +1560,28 @@ class RobloxCog(commands.Cog):
         )
 
 
-    @roblox.autocomplete(
-        "username"
-    )
-    async def roblox_autocomplete(
-        self,
-        interaction: discord.Interaction,
-        current: str,
-    ) -> list[app_commands.Choice[str]]:
-        """
-        Provide username autocomplete suggestions.
-
-        This is intentionally prepared for a future
-        Roblox username search service.
-
-        The service can later search Roblox users based on
-        the current input and return suggestions.
-        """
-
-        if not current:
-
-            return []
-
-
-        if not self._service_available():
-
-            return []
-
-
-        search_method = getattr(
-            self.service,
-            "search_users",
-            None,
-        )
-
-
-        if search_method is None:
-
-            return []
-
-
-        try:
-
-            results = await search_method(
-                current
-            )
-
-
-        except Exception:
-
-            logger.exception(
-                "Roblox username autocomplete failed."
-            )
-
-
-            return []
-
-
-        choices: list[
-            app_commands.Choice[str]
-        ] = []
-
-
-        for result in results[:25]:
-
-            username = self._get_data_value(
-                result,
-                "username",
-                None,
-            )
-
-
-            if not username:
-
-                continue
-
-
-            choices.append(
-                app_commands.Choice(
-                    name=str(
-                        username
-                    )[
-                        :100
-                    ],
-                    value=str(
-                        username
-                    )[
-                        :100
-                    ],
-                )
-            )
-
-
-        return choices
+# ============================================================
+# SETUP
+# ============================================================
 
 
 async def setup(
     bot: commands.Bot,
 ) -> None:
     """
-    Load the Roblox Cog.
-
-    The extension loader automatically discovers this
-    setup function and loads the Cog.
+    Roblox Cog setup.
     """
 
+    roblox_cog = Roblox(
+        bot,
+        roblox_service=bot.roblox_service,
+        logger=bot.logger,
+    )
+
     await bot.add_cog(
-        RobloxCog(
-            bot
-        )
+        roblox_cog,
+    )
+
+    roblox_cog.__cog_app_commands__.append(
+        roblox_cog.admin,
     )
