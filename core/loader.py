@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
-import discord
 from discord.ext import commands
 
 
@@ -15,76 +15,91 @@ if TYPE_CHECKING:
 
 
 # ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT: Final[
+    Path
+] = Path(__file__).resolve().parent.parent
+
+
+COGS_DIR: Final[
+    Path
+] = PROJECT_ROOT / "cogs"
+
+
+# ============================================================
 # COG LOADER
 # ============================================================
 
 class CogLoader:
     """
-    PAG Bot Cog Loader.
+    PAG Bot otomatik Cog Loader.
 
-    Tüm aktif Discord Cog'larını merkezi olarak
-    yükler ve güvenli şekilde kaldırır.
+    cogs/ klasöründeki Python dosyalarını
+    otomatik olarak bulur ve yükler.
 
-    Cog sırası kontrollüdür.
+    Örnek:
 
-    Örneğin:
+        cogs/
+        ├── announcement.py
+        ├── blacklist.py
+        ├── general.py
+        ├── profile.py
+        ├── roblox.py
+        ├── role_info.py
+        ├── say.py
+        ├── system.py
+        ├── top_10.py
+        ├── verify.py
+        ├── write.py
+        └── top10_service.py
 
-        announcement
-            ↓
-        blacklist
-            ↓
-        general
-            ↓
-        profile
-            ↓
-        roblox
-            ↓
-        role-info
-            ↓
-        say
-            ↓
-        system
-            ↓
-        top-10
-            ↓
-        top10
-            ↓
-        verify
-            ↓
-        write
+    Otomatik olarak:
+
+        cogs.announcement
+        cogs.blacklist
+        cogs.general
+        cogs.profile
+        cogs.roblox
+        cogs.role_info
+        cogs.say
+        cogs.system
+        cogs.top_10
+        cogs.verify
+        cogs.write
+
+    yüklenir.
+
+    Service dosyaları:
+
+        top10_service.py
+        event_service.py
+        roblox_service.py
+
+    gibi dosyalar Cog olmadığı için atlanır.
     """
 
     # ========================================================
-    # COG LIST
+    # IGNORED FILES
     # ========================================================
 
-    COGS: Final[
+    IGNORED_FILES: Final[
+        frozenset[str]
+    ] = frozenset(
+        {
+            "__init__.py",
+        }
+    )
+
+    # ========================================================
+    # IGNORED KEYWORDS
+    # ========================================================
+
+    IGNORED_KEYWORDS: Final[
         tuple[str, ...]
     ] = (
-
-        "cogs.announcement",
-
-        "cogs.blacklist",
-
-        "cogs.general",
-
-        "cogs.profile",
-
-        "cogs.roblox",
-
-        "cogs.role-info",
-
-        "cogs.say",
-
-        "cogs.system",
-
-        "cogs.top-10",
-
-        "cogs.top10",
-
-        "cogs.verify",
-
-        "cogs.write",
+        "service",
     )
 
     # ========================================================
@@ -101,67 +116,163 @@ class CogLoader:
 
         self.logger = logger
 
+        self._extensions: tuple[
+            str,
+            ...
+        ] = ()
+
     # ========================================================
-    # COMMAND TREE RESET
+    # DISCOVER COGS
     # ========================================================
 
-    def reset_command_tree(
+    def discover_cogs(
         self,
-    ) -> None:
+    ) -> tuple[str, ...]:
         """
-        Discord application command tree'sini temizler.
+        cogs/ klasöründeki geçerli Cog dosyalarını
+        otomatik olarak bulur.
 
-        Bu işlem özellikle:
+        Sadece:
 
-            - Önceki bot instance'ından kalan
-              command state'lerini
+            *.py
 
-            - Yeniden başlatma sırasında oluşabilecek
-              duplicate command kayıtlarını
+        dosyaları değerlendirilir.
 
-            - Aynı isimli slash command'lerin
-              eski referanslarını
+        Atlananlar:
 
-        temizlemek için kullanılır.
-
-        Bu işlem Discord'daki mevcut global komutları
-        doğrudan silmez.
-
-        Sadece mevcut Python process'i içindeki
-        command tree temizlenir.
+            __init__.py
+            service içeren dosyalar
+            özel Python dosyaları
+            klasörler
         """
 
-        try:
+        if not COGS_DIR.exists():
 
-            command_count = len(
-                self.bot.tree.get_commands(),
+            self.logger.warning(
+                "Cogs directory does not exist: %s",
+                COGS_DIR,
             )
 
-            if command_count == 0:
+            return ()
+
+        if not COGS_DIR.is_dir():
+
+            self.logger.error(
+                "Cogs path is not a directory: %s",
+                COGS_DIR,
+            )
+
+            return ()
+
+        discovered: list[str] = []
+
+        for file_path in sorted(
+            COGS_DIR.iterdir(),
+            key=lambda path: path.name.lower(),
+        ):
+
+            # ------------------------------------------------
+            # ONLY FILES
+            # ------------------------------------------------
+
+            if not file_path.is_file():
+
+                continue
+
+            # ------------------------------------------------
+            # ONLY PYTHON FILES
+            # ------------------------------------------------
+
+            if file_path.suffix != ".py":
+
+                continue
+
+            file_name = file_path.name
+
+            # ------------------------------------------------
+            # IGNORED FILES
+            # ------------------------------------------------
+
+            if file_name in self.IGNORED_FILES:
 
                 self.logger.debug(
-                    "Application command tree is already empty.",
+                    "Ignoring special file: %s",
+                    file_name,
                 )
 
-                return
+                continue
 
-            self.bot.tree.clear_commands(
-                guild=None,
+            # ------------------------------------------------
+            # SERVICE FILES
+            # ------------------------------------------------
+
+            file_name_lower = (
+                file_name.lower()
             )
 
-            self.logger.info(
-                "Application command tree reset. "
-                "Removed %s local command(s).",
-                command_count,
+            if any(
+                keyword in file_name_lower
+                for keyword in self.IGNORED_KEYWORDS
+            ):
+
+                self.logger.debug(
+                    "Ignoring service file: %s",
+                    file_name,
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # MODULE NAME
+            # ------------------------------------------------
+
+            module_name = (
+                file_path.stem
             )
 
-        except Exception:
+            # ------------------------------------------------
+            # PYTHON MODULE VALIDATION
+            # ------------------------------------------------
 
-            self.logger.exception(
-                "Failed to reset application command tree.",
+            if not module_name.isidentifier():
+
+                self.logger.warning(
+                    (
+                        "Ignoring invalid Python "
+                        "module filename: %s"
+                    ),
+                    file_name,
+                )
+
+                continue
+
+            extension = (
+                f"cogs.{module_name}"
             )
 
-            raise
+            discovered.append(
+                extension,
+            )
+
+        extensions = tuple(
+            discovered,
+        )
+
+        self._extensions = extensions
+
+        self.logger.info(
+            "Discovered %s Cog(s).",
+            len(extensions),
+        )
+
+        for extension in extensions:
+
+            self.logger.debug(
+                "Discovered Cog: %s",
+                extension,
+            )
+
+        return extensions
 
     # ========================================================
     # LOAD ALL
@@ -171,38 +282,35 @@ class CogLoader:
         self,
     ) -> None:
         """
-        Tüm Cog'ları sırayla yükler.
+        Bulunan bütün Cog'ları sırayla yükler.
 
-        Başlamadan önce application command tree
-        temizlenir.
+        Aynı Cog daha önce yüklenmişse
+        tekrar yüklenmez.
 
-        Böylece bot yeniden başlatıldığında
-        process içindeki eski command state'lerinin
-        yeni Cog'larla çakışması engellenir.
+        Böylece:
 
-        Bir Cog yüklenemediğinde:
+            CommandAlreadyRegistered
 
-            - Hata loglanır.
-            - Problemli extension mümkünse temizlenir.
-            - Botun tamamen çökmesi engellenir.
-
-        Böylece sağlam Cog'lar çalışmaya devam edebilir.
+        gibi gereksiz duplicate yükleme hataları
+        engellenir.
         """
 
-        # ----------------------------------------------------
-        # COMMAND TREE RESET
-        # ----------------------------------------------------
+        extensions = (
+            self.discover_cogs()
+        )
 
-        self.reset_command_tree()
+        if not extensions:
 
-        # ----------------------------------------------------
-        # LOAD EXTENSIONS
-        # ----------------------------------------------------
+            self.logger.warning(
+                "No Cog files discovered.",
+            )
 
-        for extension in self.COGS:
+            return
+
+        for extension in extensions:
 
             # ------------------------------------------------
-            # DUPLICATE EXTENSION CHECK
+            # ALREADY LOADED
             # ------------------------------------------------
 
             if extension in self.bot.extensions:
@@ -213,6 +321,10 @@ class CogLoader:
                 )
 
                 continue
+
+            # ------------------------------------------------
+            # LOAD
+            # ------------------------------------------------
 
             try:
 
@@ -225,10 +337,6 @@ class CogLoader:
                     extension,
                 )
 
-            # ------------------------------------------------
-            # ALREADY LOADED
-            # ------------------------------------------------
-
             except commands.ExtensionAlreadyLoaded:
 
                 self.logger.warning(
@@ -236,98 +344,49 @@ class CogLoader:
                     extension,
                 )
 
-                continue
-
-            # ------------------------------------------------
-            # NOT FOUND
-            # ------------------------------------------------
-
             except commands.ExtensionNotFound:
 
-                self.logger.error(
+                self.logger.exception(
                     "Cog not found: %s",
                     extension,
-                    exc_info=True,
                 )
 
-                # Eksik Cog nedeniyle botu çökertme.
                 continue
-
-            # ------------------------------------------------
-            # NO SETUP
-            # ------------------------------------------------
 
             except commands.NoEntryPointError:
 
-                self.logger.error(
-                    "Cog setup() not found: %s",
+                self.logger.exception(
+                    (
+                        "Cog setup() not found: "
+                        "%s"
+                    ),
                     extension,
-                    exc_info=True,
                 )
 
-                # Setup olmayan Cog atlanır.
                 continue
 
-            # ------------------------------------------------
-            # COMMAND ALREADY REGISTERED
-            # ------------------------------------------------
+            except commands.ExtensionFailed:
 
-            except commands.ExtensionFailed as error:
-
-                original_error = error.original
-
-                if isinstance(
-                    original_error,
-                    discord.app_commands.CommandAlreadyRegistered,
-                ):
-
-                    self.logger.error(
-                        (
-                            "Duplicate application command "
-                            "detected while loading %s: %s"
-                        ),
-                        extension,
-                        original_error,
-                    )
-
-                    self.logger.warning(
-                        (
-                            "Skipping conflicting Cog: %s. "
-                            "Check duplicate slash command names."
-                        ),
-                        extension,
-                    )
-
-                    # Extension başarısız olduğundan
-                    # normalde discord.py rollback yapar.
-                    #
-                    # Burada botun tamamen kapanmasını
-                    # engelliyoruz.
-                    continue
-
-                self.logger.error(
-                    "Cog failed to load: %s",
+                self.logger.exception(
+                    (
+                        "Cog failed to load: "
+                        "%s"
+                    ),
                     extension,
-                    exc_info=True,
                 )
 
-                # Diğer Cog'ların çalışmaya devam
-                # edebilmesi için bu extension atlanır.
                 continue
-
-            # ------------------------------------------------
-            # UNEXPECTED ERROR
-            # ------------------------------------------------
 
             except Exception:
 
                 self.logger.exception(
-                    "Unexpected error while loading cog: %s",
+                    (
+                        "Unexpected error while "
+                        "loading Cog: %s"
+                    ),
                     extension,
                 )
 
-                # Tek bir Cog yüzünden tüm botun
-                # kapanmasını engelle.
                 continue
 
     # ========================================================
@@ -338,23 +397,22 @@ class CogLoader:
         self,
     ) -> None:
         """
-        Yüklenmiş Cog'ları ters sırayla güvenli
-        şekilde kaldırır.
-
-        Ters sıra kullanılmasının amacı,
-        bağımlılığı olan sistemlerin önce
-        kaldırılmasını sağlamaktır.
+        Yüklenmiş bütün Cog'ları ters sırayla
+        güvenli şekilde kaldırır.
         """
 
+        extensions = (
+            self._extensions
+        )
+
         for extension in reversed(
-            self.COGS,
+            extensions,
         ):
 
-            # ------------------------------------------------
-            # NOT LOADED
-            # ------------------------------------------------
-
-            if extension not in self.bot.extensions:
+            if (
+                extension
+                not in self.bot.extensions
+            ):
 
                 continue
 
@@ -376,23 +434,12 @@ class CogLoader:
             except Exception:
 
                 self.logger.exception(
-                    "Failed to unload cog: %s",
+                    (
+                        "Failed to unload "
+                        "Cog: %s"
+                    ),
                     extension,
                 )
-
-        # ----------------------------------------------------
-        # COMMAND TREE RESET
-        # ----------------------------------------------------
-
-        try:
-
-            self.reset_command_tree()
-
-        except Exception:
-
-            self.logger.exception(
-                "Failed to reset command tree during unload.",
-            )
 
     # ========================================================
     # LOADED COG COUNT
@@ -402,54 +449,40 @@ class CogLoader:
         self,
     ) -> int:
         """
-        Bu loader tarafından yüklenmiş olan
-        aktif Cog sayısını döndürür.
+        Aktif yüklenmiş Cog sayısını döndürür.
         """
 
-        return sum(
-            extension in self.bot.extensions
-            for extension in self.COGS
+        return len(
+            self.bot.extensions,
         )
 
     # ========================================================
-    # LOADED COGS
+    # DISCOVERED COG COUNT
     # ========================================================
 
-    def loaded_cogs(
+    def discovered_count(
+        self,
+    ) -> int:
+        """
+        Son taramada bulunan Cog sayısını
+        döndürür.
+        """
+
+        return len(
+            self._extensions,
+        )
+
+    # ========================================================
+    # LOADED EXTENSIONS
+    # ========================================================
+
+    def loaded_extensions(
         self,
     ) -> tuple[str, ...]:
         """
-        Aktif olarak yüklenmiş Cog'ların isimlerini
-        tuple olarak döndürür.
+        Aktif yüklü Cog listesini döndürür.
         """
 
         return tuple(
-            extension
-            for extension in self.COGS
-            if extension in self.bot.extensions
+            self.bot.extensions.keys(),
         )
-
-    # ========================================================
-    # STATUS
-    # ========================================================
-
-    def status(
-        self,
-    ) -> dict[str, object]:
-        """
-        Loader durumunu döndürür.
-
-        Health/status sistemleri tarafından
-        kullanılabilir.
-        """
-
-        loaded = self.loaded_cogs()
-
-        return {
-            "total": len(self.COGS),
-            "loaded": len(loaded),
-            "extensions": loaded,
-            "commands": len(
-                self.bot.tree.get_commands(),
-            ),
-        }
