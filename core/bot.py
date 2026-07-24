@@ -96,6 +96,65 @@ class PAGBot(commands.Bot):
         self._started_at = time.monotonic()
 
     # ========================================================
+    # SYNC APPLICATION COMMANDS
+    # ========================================================
+
+    async def _sync_commands(
+        self,
+    ) -> None:
+        """
+        Slash command'lerini yalnızca yapılandırılmış
+        PAG sunucusuna senkronize eder.
+
+        Guild sync kullanıldığı için komutlar global
+        command cache beklemeden hızlı şekilde görünür.
+        """
+
+        guild_id = self.config.discord_guild_id
+
+        if not guild_id:
+
+            self.logger.warning(
+                "Guild ID is not configured. "
+                "Application commands were not synced.",
+            )
+
+            return
+
+        guild = discord.Object(
+            id=guild_id,
+        )
+
+        try:
+
+            synced_commands = await self.tree.sync(
+                guild=guild,
+            )
+
+            self.logger.info(
+                "Synced %s application command(s) "
+                "to guild %s.",
+                len(synced_commands),
+                guild_id,
+            )
+
+            for command in synced_commands:
+
+                self.logger.debug(
+                    "Synced command: /%s",
+                    command.name,
+                )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                "Failed to sync application commands.",
+            )
+
+            raise
+
+
+    # ========================================================
     # SETUP HOOK
     # ========================================================
 
@@ -165,7 +224,11 @@ class PAGBot(commands.Bot):
         # ====================================================
 
         await self.cog_loader.load_all()
+        # ====================================================
+        # APPLICATION COMMAND SYNC
+        # ====================================================
 
+        await self._sync_commands()
         self._started = True
 
         self.logger.info(
