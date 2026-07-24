@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
+from typing import Optional
 
 import discord
 from discord import app_commands
@@ -17,6 +19,7 @@ from services.top10_service import (
     Top10Service,
 )
 
+
 # ============================================================
 # SMALL HELPERS
 # ============================================================
@@ -25,9 +28,11 @@ from services.top10_service import (
 def _truncate(text: str | None, limit: int) -> str | None:
     if text is None:
         return None
+
     value = text.strip()
     if len(value) <= limit:
         return value
+
     return value[: limit - 3] + "..."
 
 
@@ -41,19 +46,31 @@ def _parse_iso_dt(value: str | None) -> datetime | None:
         return None
 
 
+def _is_true_like(value: str | bool | None) -> bool:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return False
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "evet",
+        "on",
+        "ok",
+        "confirm",
+    }
+
+
 # ============================================================
 # EMBEDS
 # ============================================================
 
 
 class Top10Embeds:
-    """
-    All Top 10 embeds are centralized here.
-
-    This keeps the Cog clean and makes styling changes
-    easy later.
-    """
-
     @staticmethod
     def error(title: str, description: str) -> discord.Embed:
         return discord.Embed(
@@ -95,8 +112,8 @@ class Top10Embeds:
         return discord.Embed(
             title="🏆 PAG TOP 10",
             description=(
-                "The PAG Top 10 is currently empty.\n\n"
-                "No players have been registered yet."
+                "PAG Top 10 şu anda boş.\n\n"
+                "Henüz listede kayıtlı oyuncu yok."
             ),
             color=discord.Color.gold(),
             timestamp=discord.utils.utcnow(),
@@ -117,9 +134,12 @@ class Top10Embeds:
 
         for entry in entries:
             prefix = medals.get(entry.position, f"`#{entry.position}`")
-
-            rank_text = f"`{entry.rank}`" if entry.rank else "`Unknown`"
-            username_text = f"`{entry.roblox_username}`" if entry.roblox_username else "`Unknown`"
+            rank_text = f"`{entry.rank}`" if entry.rank else "`Bilinmiyor`"
+            username_text = (
+                f"`{entry.roblox_username}`"
+                if entry.roblox_username
+                else "`Bilinmiyor`"
+            )
 
             lines.append(
                 (
@@ -131,20 +151,24 @@ class Top10Embeds:
         embed = discord.Embed(
             title="🏆 PAG TOP 10",
             description=(
-                "Official ranking overview.\n\n"
+                "Resmî sıralama görünümü.\n\n"
                 + "\n\n".join(lines)
             ),
             color=discord.Color.gold(),
             timestamp=discord.utils.utcnow(),
         )
-
         embed.set_footer(
-            text=f"PAG • {len(entries)}/10 positions filled",
+            text=f"PAG • {len(entries)}/{Top10Service.MAX_ENTRIES} dolu",
         )
         return embed
 
     @staticmethod
-    def player(entry: Top10Entry, *, page_index: int, total_pages: int) -> discord.Embed:
+    def player(
+        entry: Top10Entry,
+        *,
+        page_index: int,
+        total_pages: int,
+    ) -> discord.Embed:
         medals = {
             1: "🥇",
             2: "🥈",
@@ -173,13 +197,11 @@ class Top10Embeds:
             value=f"**#{entry.position}**",
             inline=True,
         )
-
         embed.add_field(
             name="👤 Roblox ID",
             value=f"`{entry.roblox_user_id}`",
             inline=True,
         )
-
         embed.add_field(
             name="🎖️ Rank",
             value=f"`{entry.rank}`",
@@ -189,7 +211,7 @@ class Top10Embeds:
         if entry.notes:
             embed.add_field(
                 name="📝 Notes",
-                value=_truncate(entry.notes, 1024) or "Unknown",
+                value=_truncate(entry.notes, 1024) or "Bilinmiyor",
                 inline=False,
             )
 
@@ -198,7 +220,6 @@ class Top10Embeds:
             value=f"<@{entry.added_by}>",
             inline=True,
         )
-
         embed.add_field(
             name="✏️ Updated By",
             value=f"<@{entry.updated_by}>",
@@ -225,35 +246,31 @@ class Top10Embeds:
         if entry.avatar_url:
             embed.set_thumbnail(url=entry.avatar_url)
 
-        if entry.profile_url:
-            embed.set_footer(
-                text=f"PAG Top 10 • Page {page_index + 1}/{total_pages}",
-            )
-        else:
-            embed.set_footer(
-                text=f"PAG Top 10 • Page {page_index + 1}/{total_pages}",
-            )
-
+        embed.set_footer(
+            text=f"PAG Top 10 • Sayfa {page_index + 1}/{total_pages}",
+        )
         return embed
 
     @staticmethod
-    def management(count: int, is_full: bool) -> discord.Embed:
-        status_text = "Full" if is_full else "Open"
+    def management(count: int) -> discord.Embed:
+        status_text = "Dolu" if count >= Top10Service.MAX_ENTRIES else "Açık"
 
         embed = discord.Embed(
             title="🏆 PAG TOP 10 MANAGEMENT",
             description=(
-                "Manage the ranking system using the controls below.\n\n"
-                "➕ **Add / Replace**\n"
-                "Add a player to a position.\n\n"
-                "✏️ **Edit**\n"
-                "Update an existing player.\n\n"
-                "🗑️ **Remove**\n"
-                "Remove a player after confirmation.\n\n"
-                "⚠️ **Reset**\n"
-                "Clear the entire ranking.\n\n"
+                "Top 10 sistemini aşağıdaki kontrollerle yönet.\n\n"
+                "➕ **Add Player**\n"
+                "Boş pozisyona oyuncu ekler.\n\n"
+                "♻️ **Replace Player**\n"
+                "Dolu pozisyondaki oyuncuyu değiştirir.\n\n"
+                "✏️ **Edit Player**\n"
+                "Var olan kaydı günceller.\n\n"
+                "🗑️ **Remove Player**\n"
+                "Bir oyuncuyu kaldırır.\n\n"
                 "📊 **View Rankings**\n"
-                "Show the current Top 10."
+                "Güncel sıralamayı gösterir.\n\n"
+                "⚠️ **Reset**\n"
+                "Tüm listeyi sıfırlar."
             ),
             color=discord.Color.blurple(),
             timestamp=discord.utils.utcnow(),
@@ -261,16 +278,14 @@ class Top10Embeds:
 
         embed.add_field(
             name="📈 Current Entries",
-            value=f"`{count}/10`",
+            value=f"`{count}/{Top10Service.MAX_ENTRIES}`",
             inline=True,
         )
-
         embed.add_field(
             name="📌 Status",
             value=f"`{status_text}`",
             inline=True,
         )
-
         embed.set_footer(
             text="PAG • Admin tools",
         )
@@ -278,56 +293,61 @@ class Top10Embeds:
 
 
 # ============================================================
-# ERROR MAPPING
+# ERROR MAPPER
 # ============================================================
 
 
 class Top10ErrorMapper:
     @staticmethod
-    def map(error: Exception, *, position: int | None = None, username: str | None = None) -> tuple[str, str]:
+    def map(
+        error: Exception,
+        *,
+        position: int | None = None,
+        username: str | None = None,
+    ) -> tuple[str, str]:
         if isinstance(error, InvalidPositionError):
             return (
-                "❌ Invalid Position",
-                "Position must be between **1** and **10**.",
+                "❌ Geçersiz Pozisyon",
+                "Pozisyon **1** ile **10** arasında olmalı.",
             )
 
         if isinstance(error, PlayerAlreadyExistsError):
             return (
-                "❌ Player Already Exists",
-                f"**{username or 'This player'}** is already in the Top 10.",
+                "❌ Oyuncu Zaten Var",
+                f"**{username or 'Bu oyuncu'}** zaten Top 10 içinde.",
             )
 
         if isinstance(error, PositionOccupiedError):
             if position is None:
                 return (
-                    "❌ Position Occupied",
-                    "That position is already occupied.",
+                    "❌ Pozisyon Dolu",
+                    "Bu pozisyon zaten dolu.",
                 )
             return (
-                "❌ Position Occupied",
-                f"Position **#{position}** is already occupied.",
+                "❌ Pozisyon Dolu",
+                f"**#{position}** pozisyonu zaten dolu.",
             )
 
         if isinstance(error, PlayerNotFoundError):
             if position is None:
                 return (
-                    "❌ Player Not Found",
-                    f"**{username or 'The requested player'}** could not be found.",
+                    "❌ Oyuncu Bulunamadı",
+                    f"**{username or 'İstenen oyuncu'}** bulunamadı.",
                 )
             return (
-                "❌ Player Not Found",
-                f"No player exists at position **#{position}**.",
+                "❌ Oyuncu Bulunamadı",
+                f"**#{position}** pozisyonunda oyuncu yok.",
             )
 
         if isinstance(error, Top10Error):
             return (
-                "❌ Top 10 Error",
-                "The Top 10 service could not complete this operation.",
+                "❌ Top 10 Hatası",
+                "Top 10 servisi işlemi tamamlayamadı.",
             )
 
         return (
-            "❌ Unexpected Error",
-            "An unexpected error occurred while processing the request.",
+            "❌ Beklenmeyen Hata",
+            "İşlem sırasında beklenmeyen bir hata oluştu.",
         )
 
 
@@ -337,24 +357,17 @@ class Top10ErrorMapper:
 
 
 class Top10RankingView(discord.ui.View):
-    """
-    Lightweight page view for the public Top 10 display.
-
-    It loads entries once and navigates locally.
-    A refresh button is available if the service is provided.
-    """
-
     def __init__(
         self,
         *,
+        service: Top10Service,
         entries: list[Top10Entry],
-        service: Top10Service | None = None,
         author_id: int | None = None,
         timeout: float = 180.0,
     ) -> None:
         super().__init__(timeout=timeout)
-        self.entries = entries
         self.service = service
+        self.entries = entries
         self.author_id = author_id
         self.current_index = 0
         self.show_overview = False
@@ -374,7 +387,7 @@ class Top10RankingView(discord.ui.View):
             or self.current_index >= len(self.entries) - 1
         )
         self.overview_button.disabled = not has_entries
-        self.refresh_button.disabled = self.service is None or not has_entries
+        self.refresh_button.disabled = not has_entries
 
     def _current_embed(self) -> discord.Embed:
         if not self.entries:
@@ -383,9 +396,8 @@ class Top10RankingView(discord.ui.View):
         if self.show_overview:
             return Top10Embeds.overview(self.entries)
 
-        current = self.entries[self.current_index]
         return Top10Embeds.player(
-            current,
+            self.entries[self.current_index],
             page_index=self.current_index,
             total_pages=len(self.entries),
         )
@@ -393,25 +405,11 @@ class Top10RankingView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if self.author_id is not None and interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "❌ You cannot control this ranking panel.",
+                "❌ Bu paneli kullanamazsın.",
                 ephemeral=True,
             )
             return False
         return True
-
-    async def _edit_current(self, interaction: discord.Interaction) -> None:
-        if not self.entries:
-            await interaction.response.edit_message(
-                embed=Top10Embeds.empty(),
-                view=None,
-            )
-            return
-
-        self._sync_buttons()
-        await interaction.response.edit_message(
-            embed=self._current_embed(),
-            view=self,
-        )
 
     @discord.ui.button(
         label="Previous",
@@ -427,7 +425,12 @@ class Top10RankingView(discord.ui.View):
         self.show_overview = False
         if self.current_index > 0:
             self.current_index -= 1
-        await self._edit_current(interaction)
+
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            embed=self._current_embed(),
+            view=self,
+        )
 
     @discord.ui.button(
         label="Overview",
@@ -441,7 +444,11 @@ class Top10RankingView(discord.ui.View):
         button: discord.ui.Button,
     ) -> None:
         self.show_overview = not self.show_overview
-        await self._edit_current(interaction)
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            embed=self._current_embed(),
+            view=self,
+        )
 
     @discord.ui.button(
         label="Next",
@@ -457,7 +464,12 @@ class Top10RankingView(discord.ui.View):
         self.show_overview = False
         if self.current_index < len(self.entries) - 1:
             self.current_index += 1
-        await self._edit_current(interaction)
+
+        self._sync_buttons()
+        await interaction.response.edit_message(
+            embed=self._current_embed(),
+            view=self,
+        )
 
     @discord.ui.button(
         label="Refresh",
@@ -470,42 +482,41 @@ class Top10RankingView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
-        if self.service is None:
-            await interaction.response.send_message(
-                "❌ Refresh is unavailable.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
+        await interaction.response.defer()
 
         try:
             self.entries = await self.service.get_all()
         except Exception:
-            await interaction.followup.send(
+            self._sync_buttons()
+            self.logger = logging.getLogger("Top10RankingView")
+            self.logger.exception("Top 10 yenilenemedi.")
+
+            await interaction.edit_original_response(
                 embed=Top10Embeds.error(
-                    "❌ Refresh Failed",
-                    "The latest ranking could not be loaded.",
+                    "❌ Yenileme Başarısız",
+                    "Güncel sıralama alınamadı.",
                 ),
-                ephemeral=True,
+                view=None,
             )
             return
 
         if not self.entries:
-            await interaction.followup.send(
+            await interaction.edit_original_response(
                 embed=Top10Embeds.empty(),
-                ephemeral=True,
+                view=None,
             )
-            await interaction.message.edit(view=None)
+            self.stop()
             return
 
         if self.current_index >= len(self.entries):
             self.current_index = len(self.entries) - 1
 
+        self.show_overview = False
         self._sync_buttons()
-        await interaction.followup.send(
+
+        await interaction.edit_original_response(
             embed=self._current_embed(),
-            ephemeral=True,
+            view=self,
         )
 
     @discord.ui.button(
@@ -522,7 +533,9 @@ class Top10RankingView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await interaction.response.edit_message(view=None)
+        await interaction.response.edit_message(
+            view=None,
+        )
         self.stop()
 
     async def on_timeout(self) -> None:
@@ -531,18 +544,626 @@ class Top10RankingView(discord.ui.View):
 
 
 # ============================================================
-# MANAGEMENT PANEL VIEW
+# ADD MODAL
+# ============================================================
+
+
+class Top10AddModal(discord.ui.Modal, title="PAG Top 10 Oyuncu Ekle"):
+    position = discord.ui.TextInput(
+        label="Position",
+        placeholder="1 - 10",
+        min_length=1,
+        max_length=2,
+        required=True,
+    )
+
+    username = discord.ui.TextInput(
+        label="Roblox Username",
+        placeholder="Roblox kullanıcı adı",
+        min_length=1,
+        max_length=20,
+        required=True,
+    )
+
+    rank = discord.ui.TextInput(
+        label="PAG Rank",
+        placeholder="PT1, ET3, LT vb.",
+        min_length=1,
+        max_length=50,
+        required=True,
+    )
+
+    notes = discord.ui.TextInput(
+        label="Notes",
+        placeholder="İsteğe bağlı not",
+        style=discord.TextStyle.paragraph,
+        max_length=500,
+        required=False,
+    )
+
+    def __init__(
+        self,
+        *,
+        service: Top10Service,
+        logger: logging.Logger,
+        added_by: int,
+        replace_existing: bool,
+    ) -> None:
+        super().__init__()
+        self.service = service
+        self.logger = logger
+        self.added_by = added_by
+        self.replace_existing = replace_existing
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            position = int(self.position.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                embed=Top10Embeds.error(
+                    "❌ Geçersiz Pozisyon",
+                    "Pozisyon sayısal olmalı.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        username = self.username.value.strip()
+        rank = self.rank.value.strip()
+        notes = self.notes.value.strip() or None
+
+        if not username:
+            await interaction.response.send_message(
+                embed=Top10Embeds.error(
+                    "❌ Geçersiz Kullanıcı Adı",
+                    "Roblox kullanıcı adı boş olamaz.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if not rank:
+            await interaction.response.send_message(
+                embed=Top10Embeds.error(
+                    "❌ Geçersiz Rank",
+                    "PAG rank boş olamaz.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            entry = await self.service.add(
+                position=position,
+                username=username,
+                rank=rank,
+                added_by=self.added_by,
+                notes=notes,
+                replace_existing=self.replace_existing,
+            )
+        except (
+            InvalidPositionError,
+            PlayerAlreadyExistsError,
+            PositionOccupiedError,
+            PlayerNotFoundError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(
+                error,
+                position=position,
+                username=username,
+            )
+            await interaction.followup.send(
+                embed=Top10Embeds.error(title, description),
+                ephemeral=True,
+            )
+            return
+        except sqlite3.IntegrityError:
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Veritabanı Çakışması",
+                    "Kayıt veritabanına yazılamadı.",
+                ),
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            self.logger.exception("Top 10 ekleme sırasında beklenmeyen hata.")
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Beklenmeyen Hata",
+                    "Oyuncu eklenemedi.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        embed = Top10Embeds.success(
+            "✅ Oyuncu Eklendi",
+            f"**{entry.roblox_display_name}** başarıyla **#{entry.position}** konumuna yazıldı.",
+        )
+        embed.add_field(
+            name="Roblox",
+            value=f"`{entry.roblox_username}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Rank",
+            value=f"`{entry.rank}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="User ID",
+            value=f"`{entry.roblox_user_id}`",
+            inline=True,
+        )
+
+        if entry.avatar_url:
+            embed.set_thumbnail(url=entry.avatar_url)
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# EDIT MODAL
+# ============================================================
+
+
+class Top10EditModal(discord.ui.Modal, title="PAG Top 10 Oyuncu Düzenle"):
+    position = discord.ui.TextInput(
+        label="Current Position",
+        placeholder="1 - 10",
+        min_length=1,
+        max_length=2,
+        required=True,
+    )
+
+    username = discord.ui.TextInput(
+        label="New Roblox Username",
+        placeholder="Boş bırakırsan aynı kalır",
+        required=False,
+        max_length=20,
+    )
+
+    rank = discord.ui.TextInput(
+        label="New PAG Rank",
+        placeholder="Boş bırakırsan aynı kalır",
+        required=False,
+        max_length=50,
+    )
+
+    new_position = discord.ui.TextInput(
+        label="New Position",
+        placeholder="Boş bırakırsan aynı kalır",
+        required=False,
+        max_length=2,
+    )
+
+    notes = discord.ui.TextInput(
+        label="New Notes",
+        placeholder="Boş bırakırsan aynı kalır",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=500,
+    )
+
+    def __init__(
+        self,
+        *,
+        service: Top10Service,
+        logger: logging.Logger,
+        updated_by: int,
+    ) -> None:
+        super().__init__()
+        self.service = service
+        self.logger = logger
+        self.updated_by = updated_by
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            position = int(self.position.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                embed=Top10Embeds.error(
+                    "❌ Geçersiz Pozisyon",
+                    "Mevcut pozisyon sayısal olmalı.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        username = self.username.value.strip() or None
+        rank = self.rank.value.strip() or None
+        notes = self.notes.value.strip() or None
+
+        new_position: int | None = None
+        if self.new_position.value.strip():
+            try:
+                new_position = int(self.new_position.value.strip())
+            except ValueError:
+                await interaction.response.send_message(
+                    embed=Top10Embeds.error(
+                        "❌ Geçersiz Yeni Pozisyon",
+                        "Yeni pozisyon sayısal olmalı.",
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        if username is None and rank is None and notes is None and new_position is None:
+            await interaction.response.send_message(
+                embed=Top10Embeds.warning(
+                    "⚠️ Değiştirilecek Alan Yok",
+                    "Kaydetmeden önce en az bir alan değişmeli.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            entry = await self.service.update(
+                position=position,
+                updated_by=self.updated_by,
+                username=username,
+                rank=rank,
+                notes=notes,
+                new_position=new_position,
+            )
+        except (
+            InvalidPositionError,
+            PlayerAlreadyExistsError,
+            PositionOccupiedError,
+            PlayerNotFoundError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(
+                error,
+                position=new_position or position,
+                username=username,
+            )
+            await interaction.followup.send(
+                embed=Top10Embeds.error(title, description),
+                ephemeral=True,
+            )
+            return
+        except sqlite3.IntegrityError:
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Veritabanı Çakışması",
+                    "Güncelleme veritabanına yazılamadı.",
+                ),
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            self.logger.exception("Top 10 düzenleme sırasında beklenmeyen hata.")
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Beklenmeyen Hata",
+                    "Oyuncu güncellenemedi.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        embed = Top10Embeds.success(
+            "✅ Oyuncu Güncellendi",
+            f"**{entry.roblox_display_name}** başarıyla güncellendi.",
+        )
+        embed.add_field(
+            name="Position",
+            value=f"**#{entry.position}**",
+            inline=True,
+        )
+        embed.add_field(
+            name="Roblox",
+            value=f"`{entry.roblox_username}`",
+            inline=True,
+        )
+        embed.add_field(
+            name="Rank",
+            value=f"`{entry.rank}`",
+            inline=True,
+        )
+
+        if entry.avatar_url:
+            embed.set_thumbnail(url=entry.avatar_url)
+
+        await interaction.followup.send(
+            embed=embed,
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# REMOVE CONFIRM VIEW
+# ============================================================
+
+
+class Top10RemoveConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        service: Top10Service,
+        logger: logging.Logger,
+        entry: Top10Entry,
+        author_id: int,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.service = service
+        self.logger = logger
+        self.entry = entry
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Bu onay paneli sana ait değil.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Remove",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def confirm_remove(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            removed = await self.service.remove(self.entry.position)
+        except (
+            InvalidPositionError,
+            PlayerNotFoundError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(
+                error,
+                position=self.entry.position,
+            )
+            await interaction.followup.send(
+                embed=Top10Embeds.error(title, description),
+                ephemeral=True,
+            )
+            self.stop()
+            return
+        except Exception:
+            self.logger.exception("Top 10 silme sırasında beklenmeyen hata.")
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Silme Başarısız",
+                    "Oyuncu kaldırılamadı.",
+                ),
+                ephemeral=True,
+            )
+            self.stop()
+            return
+
+        await interaction.followup.send(
+            embed=Top10Embeds.success(
+                "✅ Oyuncu Kaldırıldı",
+                f"**{removed.roblox_display_name}** başarıyla **#{removed.position}** konumundan kaldırıldı.",
+            ),
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel_remove(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="❎ Kaldırma iptal edildi.",
+            embed=None,
+            view=None,
+        )
+        self.stop()
+
+
+class Top10RemoveModal(discord.ui.Modal, title="PAG Top 10 Oyuncu Kaldır"):
+    position = discord.ui.TextInput(
+        label="Position",
+        placeholder="1 - 10",
+        min_length=1,
+        max_length=2,
+        required=True,
+    )
+
+    def __init__(
+        self,
+        *,
+        service: Top10Service,
+        logger: logging.Logger,
+        author_id: int,
+    ) -> None:
+        super().__init__()
+        self.service = service
+        self.logger = logger
+        self.author_id = author_id
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            position = int(self.position.value.strip())
+        except ValueError:
+            await interaction.response.send_message(
+                embed=Top10Embeds.error(
+                    "❌ Geçersiz Pozisyon",
+                    "Pozisyon sayısal olmalı.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            entry = await self.service.get_by_position(position)
+        except (
+            InvalidPositionError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(
+                error,
+                position=position,
+            )
+            await interaction.followup.send(
+                embed=Top10Embeds.error(title, description),
+                ephemeral=True,
+            )
+            return
+        except Exception:
+            self.logger.exception("Silmeden önce oyuncu yüklenemedi.")
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Yükleme Başarısız",
+                    "Oyuncu kontrol edilemedi.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if entry is None:
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Pozisyon Boş",
+                    f"**#{position}** pozisyonunda oyuncu yok.",
+                ),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            embed=Top10Embeds.warning(
+                "⚠️ Silmeyi Onayla",
+                f"**{entry.roblox_display_name}** oyuncusu **#{entry.position}** konumundan kaldırılsın mı?",
+            ),
+            view=Top10RemoveConfirmView(
+                service=self.service,
+                logger=self.logger,
+                entry=entry,
+                author_id=self.author_id,
+            ),
+            ephemeral=True,
+        )
+
+
+# ============================================================
+# RESET CONFIRM VIEW
+# ============================================================
+
+
+class Top10ResetConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        service: Top10Service,
+        logger: logging.Logger,
+        author_id: int,
+    ) -> None:
+        super().__init__(timeout=120)
+        self.service = service
+        self.logger = logger
+        self.author_id = author_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message(
+                "❌ Bu onay paneli sana ait değil.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Confirm Reset",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def confirm_reset(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            deleted_count = await self.service.clear()
+        except Exception:
+            self.logger.exception("Top 10 sıfırlanamadı.")
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Reset Başarısız",
+                    "Top 10 listesi sıfırlanamadı.",
+                ),
+                ephemeral=True,
+            )
+            self.stop()
+            return
+
+        await interaction.followup.send(
+            embed=Top10Embeds.success(
+                "✅ Top 10 Sıfırlandı",
+                f"Listeden **{deleted_count}** kayıt silindi.",
+            ),
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(
+        label="Cancel",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel_reset(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.response.edit_message(
+            content="❎ Reset iptal edildi.",
+            embed=None,
+            view=None,
+        )
+        self.stop()
+
+
+# ============================================================
+# MANAGEMENT VIEW
 # ============================================================
 
 
 class Top10ManagementView(discord.ui.View):
-    """
-    Private admin panel for Top 10 operations.
-
-    It is locked to the command author and requires
-    Administrator permission on interaction.
-    """
-
     def __init__(
         self,
         *,
@@ -558,7 +1179,7 @@ class Top10ManagementView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message(
-                "❌ This management panel belongs to another administrator.",
+                "❌ Bu panel başka bir yöneticiye ait.",
                 ephemeral=True,
             )
             return False
@@ -568,7 +1189,7 @@ class Top10ManagementView(discord.ui.View):
             and interaction.user.guild_permissions.administrator
         ):
             await interaction.response.send_message(
-                "❌ You need Administrator permission to use this panel.",
+                "❌ Bu panel için Administrator yetkisi gerekir.",
                 ephemeral=True,
             )
             return False
@@ -576,12 +1197,32 @@ class Top10ManagementView(discord.ui.View):
         return True
 
     @discord.ui.button(
-        label="Add / Replace",
+        label="Add Player",
         emoji="➕",
         style=discord.ButtonStyle.success,
         row=0,
     )
     async def add_player(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.send_modal(
+            Top10AddModal(
+                service=self.service,
+                logger=self.logger,
+                added_by=interaction.user.id,
+                replace_existing=False,
+            )
+        )
+
+    @discord.ui.button(
+        label="Replace Player",
+        emoji="♻️",
+        style=discord.ButtonStyle.primary,
+        row=0,
+    )
+    async def replace_player(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button,
@@ -598,8 +1239,8 @@ class Top10ManagementView(discord.ui.View):
     @discord.ui.button(
         label="Edit Player",
         emoji="✏️",
-        style=discord.ButtonStyle.primary,
-        row=0,
+        style=discord.ButtonStyle.secondary,
+        row=1,
     )
     async def edit_player(
         self,
@@ -637,7 +1278,7 @@ class Top10ManagementView(discord.ui.View):
         label="View Rankings",
         emoji="🏆",
         style=discord.ButtonStyle.secondary,
-        row=1,
+        row=2,
     )
     async def view_rankings(
         self,
@@ -649,11 +1290,11 @@ class Top10ManagementView(discord.ui.View):
         try:
             entries = await self.service.get_all()
         except Exception:
-            self.logger.exception("Failed to load Top 10 rankings.")
+            self.logger.exception("Top 10 listesi yüklenemedi.")
             await interaction.followup.send(
                 embed=Top10Embeds.error(
-                    "❌ Failed to Load",
-                    "The ranking list could not be loaded.",
+                    "❌ Yükleme Başarısız",
+                    "Top 10 listesi alınamadı.",
                 ),
                 ephemeral=True,
             )
@@ -673,9 +1314,9 @@ class Top10ManagementView(discord.ui.View):
                 total_pages=len(entries),
             ),
             view=Top10RankingView(
-                entries=entries,
                 service=self.service,
-                author_id=self.author_id,
+                entries=entries,
+                author_id=interaction.user.id,
             ),
             ephemeral=True,
         )
@@ -693,16 +1334,16 @@ class Top10ManagementView(discord.ui.View):
     ) -> None:
         await interaction.response.send_message(
             embed=Top10Embeds.warning(
-                "⚠️ Reset Top 10?",
+                "⚠️ Top 10 Sıfırlansın mı?",
                 (
-                    "This will remove every player from the ranking.\n\n"
-                    "This action cannot be undone."
+                    "Bu işlem listedeki tüm oyuncuları siler.\n\n"
+                    "Devam etmek için onay vermelisin."
                 ),
             ),
             view=Top10ResetConfirmView(
                 service=self.service,
                 logger=self.logger,
-                author_id=self.author_id,
+                author_id=interaction.user.id,
             ),
             ephemeral=True,
         )
@@ -721,588 +1362,14 @@ class Top10ManagementView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        await interaction.response.edit_message(view=None)
+        await interaction.response.edit_message(
+            view=None,
+        )
         self.stop()
 
     async def on_timeout(self) -> None:
         for child in self.children:
             child.disabled = True
-
-
-# ============================================================
-# ADD MODAL
-# ============================================================
-
-
-class Top10AddModal(discord.ui.Modal, title="Add / Replace PAG Top 10 Player"):
-    position = discord.ui.TextInput(
-        label="Position",
-        placeholder="1 - 10",
-        min_length=1,
-        max_length=2,
-        required=True,
-    )
-
-    username = discord.ui.TextInput(
-        label="Roblox Username",
-        placeholder="Exact Roblox username",
-        min_length=1,
-        max_length=20,
-        required=True,
-    )
-
-    rank = discord.ui.TextInput(
-        label="PAG Rank",
-        placeholder="PT1, ET2, LT, etc.",
-        min_length=1,
-        max_length=50,
-        required=True,
-    )
-
-    notes = discord.ui.TextInput(
-        label="Notes",
-        placeholder="Optional notes",
-        style=discord.TextStyle.paragraph,
-        max_length=500,
-        required=False,
-    )
-
-    def __init__(
-        self,
-        *,
-        service: Top10Service,
-        logger: logging.Logger,
-        added_by: int,
-        replace_existing: bool = True,
-    ) -> None:
-        super().__init__()
-        self.service = service
-        self.logger = logger
-        self.added_by = added_by
-        self.replace_existing = replace_existing
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            position = int(self.position.value.strip())
-        except ValueError:
-            await interaction.response.send_message(
-                embed=Top10Embeds.error(
-                    "❌ Invalid Position",
-                    "Position must be a number between **1** and **10**.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        username = self.username.value.strip()
-        rank = self.rank.value.strip()
-        notes = self.notes.value.strip() or None
-
-        if not username:
-            await interaction.response.send_message(
-                embed=Top10Embeds.error(
-                    "❌ Invalid Username",
-                    "Roblox username cannot be empty.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        if not rank:
-            await interaction.response.send_message(
-                embed=Top10Embeds.error(
-                    "❌ Invalid Rank",
-                    "PAG rank cannot be empty.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            entry = await self.service.add(
-                position=position,
-                username=username,
-                rank=rank,
-                added_by=self.added_by,
-                notes=notes,
-                replace_existing=self.replace_existing,
-            )
-        except (
-            InvalidPositionError,
-            PlayerAlreadyExistsError,
-            PositionOccupiedError,
-            PlayerNotFoundError,
-            Top10Error,
-        ) as error:
-            title, description = Top10ErrorMapper.map(
-                error,
-                position=position,
-                username=username,
-            )
-            await interaction.followup.send(
-                embed=Top10Embeds.error(title, description),
-                ephemeral=True,
-            )
-            return
-        except sqlite3.IntegrityError:
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Database Conflict",
-                    "A database constraint prevented this player from being added.",
-                ),
-                ephemeral=True,
-            )
-            return
-        except Exception:
-            self.logger.exception("Unexpected error while adding Top 10 player.")
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Unexpected Error",
-                    "The player could not be added.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        embed = Top10Embeds.success(
-            "✅ Player Added",
-            f"**{entry.roblox_display_name}** has been placed at **#{entry.position}**.",
-        )
-        embed.add_field(name="Roblox", value=f"`{entry.roblox_username}`", inline=True)
-        embed.add_field(name="Rank", value=f"`{entry.rank}`", inline=True)
-        embed.add_field(name="User ID", value=f"`{entry.roblox_user_id}`", inline=True)
-
-        if entry.avatar_url:
-            embed.set_thumbnail(url=entry.avatar_url)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-# ============================================================
-# EDIT MODAL
-# ============================================================
-
-
-class Top10EditModal(discord.ui.Modal, title="Edit PAG Top 10 Player"):
-    position = discord.ui.TextInput(
-        label="Current Position",
-        placeholder="1 - 10",
-        min_length=1,
-        max_length=2,
-        required=True,
-    )
-
-    username = discord.ui.TextInput(
-        label="New Roblox Username",
-        placeholder="Leave empty to keep current username",
-        required=False,
-        max_length=20,
-    )
-
-    rank = discord.ui.TextInput(
-        label="New PAG Rank",
-        placeholder="Leave empty to keep current rank",
-        required=False,
-        max_length=50,
-    )
-
-    new_position = discord.ui.TextInput(
-        label="New Position",
-        placeholder="Leave empty to keep current position",
-        required=False,
-        max_length=2,
-    )
-
-    notes = discord.ui.TextInput(
-        label="New Notes",
-        placeholder="Leave empty to keep current notes",
-        style=discord.TextStyle.paragraph,
-        required=False,
-        max_length=500,
-    )
-
-    def __init__(
-        self,
-        *,
-        service: Top10Service,
-        logger: logging.Logger,
-        updated_by: int,
-    ) -> None:
-        super().__init__()
-        self.service = service
-        self.logger = logger
-        self.updated_by = updated_by
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            position = int(self.position.value.strip())
-        except ValueError:
-            await interaction.response.send_message(
-                embed=Top10Embeds.error(
-                    "❌ Invalid Position",
-                    "Current position must be a number between **1** and **10**.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        username = self.username.value.strip() or None
-        rank = self.rank.value.strip() or None
-        notes = self.notes.value.strip() or None
-
-        new_position: int | None = None
-        if self.new_position.value.strip():
-            try:
-                new_position = int(self.new_position.value.strip())
-            except ValueError:
-                await interaction.response.send_message(
-                    embed=Top10Embeds.error(
-                        "❌ Invalid Position",
-                        "New position must be a number between **1** and **10**.",
-                    ),
-                    ephemeral=True,
-                )
-                return
-
-        if username is None and rank is None and notes is None and new_position is None:
-            await interaction.response.send_message(
-                embed=Top10Embeds.warning(
-                    "⚠️ Nothing to Update",
-                    "At least one field must be changed before saving.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            entry = await self.service.update(
-                position=position,
-                updated_by=self.updated_by,
-                username=username,
-                rank=rank,
-                notes=notes,
-                new_position=new_position,
-            )
-        except (
-            InvalidPositionError,
-            PlayerAlreadyExistsError,
-            PositionOccupiedError,
-            PlayerNotFoundError,
-            Top10Error,
-        ) as error:
-            title, description = Top10ErrorMapper.map(
-                error,
-                position=new_position or position,
-                username=username,
-            )
-            await interaction.followup.send(
-                embed=Top10Embeds.error(title, description),
-                ephemeral=True,
-            )
-            return
-        except sqlite3.IntegrityError:
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Database Conflict",
-                    "A database constraint prevented this player from being updated.",
-                ),
-                ephemeral=True,
-            )
-            return
-        except Exception:
-            self.logger.exception("Unexpected error while editing Top 10 player.")
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Unexpected Error",
-                    "The player could not be updated.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        embed = Top10Embeds.success(
-            "✅ Player Updated",
-            f"**{entry.roblox_display_name}** has been updated successfully.",
-        )
-        embed.add_field(name="Position", value=f"**#{entry.position}**", inline=True)
-        embed.add_field(name="Roblox", value=f"`{entry.roblox_username}`", inline=True)
-        embed.add_field(name="Rank", value=f"`{entry.rank}`", inline=True)
-
-        if entry.avatar_url:
-            embed.set_thumbnail(url=entry.avatar_url)
-
-        await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-# ============================================================
-# REMOVE MODAL + CONFIRM VIEW
-# ============================================================
-
-
-class Top10RemoveConfirmView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        service: Top10Service,
-        logger: logging.Logger,
-        entry: Top10Entry,
-        author_id: int,
-    ) -> None:
-        super().__init__(timeout=120)
-        self.service = service
-        self.logger = logger
-        self.entry = entry
-        self.author_id = author_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "❌ This confirmation panel belongs to another administrator.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    @discord.ui.button(
-        label="Remove",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger,
-    )
-    async def confirm_remove(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            removed = await self.service.remove(self.entry.position)
-        except (
-            InvalidPositionError,
-            PlayerNotFoundError,
-            Top10Error,
-        ) as error:
-            title, description = Top10ErrorMapper.map(error, position=self.entry.position)
-            await interaction.followup.send(
-                embed=Top10Embeds.error(title, description),
-                ephemeral=True,
-            )
-            self.stop()
-            return
-        except Exception:
-            self.logger.exception("Unexpected error while removing Top 10 player.")
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Remove Failed",
-                    "The player could not be removed.",
-                ),
-                ephemeral=True,
-            )
-            self.stop()
-            return
-
-        await interaction.followup.send(
-            embed=Top10Embeds.success(
-                "✅ Player Removed",
-                f"**{removed.roblox_display_name}** has been removed from **#{removed.position}**.",
-            ),
-            ephemeral=True,
-        )
-        self.stop()
-
-    @discord.ui.button(
-        label="Cancel",
-        emoji="✖️",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def cancel_remove(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.edit_message(
-            content="❎ Removal cancelled.",
-            embed=None,
-            view=None,
-        )
-        self.stop()
-
-
-class Top10RemoveModal(discord.ui.Modal, title="Remove PAG Top 10 Player"):
-    position = discord.ui.TextInput(
-        label="Position",
-        placeholder="1 - 10",
-        min_length=1,
-        max_length=2,
-        required=True,
-    )
-
-    def __init__(
-        self,
-        *,
-        service: Top10Service,
-        logger: logging.Logger,
-        author_id: int,
-    ) -> None:
-        super().__init__()
-        self.service = service
-        self.logger = logger
-        self.author_id = author_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            position = int(self.position.value.strip())
-        except ValueError:
-            await interaction.response.send_message(
-                embed=Top10Embeds.error(
-                    "❌ Invalid Position",
-                    "Position must be a number between **1** and **10**.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            entry = await self.service.get_by_position(position)
-        except (InvalidPositionError, Top10Error) as error:
-            title, description = Top10ErrorMapper.map(error, position=position)
-            await interaction.followup.send(
-                embed=Top10Embeds.error(title, description),
-                ephemeral=True,
-            )
-            return
-        except Exception:
-            self.logger.exception("Failed to load player before removal.")
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Lookup Failed",
-                    "The selected player could not be loaded.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        if entry is None:
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Position Empty",
-                    f"No player exists at position **#{position}**.",
-                ),
-                ephemeral=True,
-            )
-            return
-
-        await interaction.followup.send(
-            embed=Top10Embeds.warning(
-                "⚠️ Confirm Removal",
-                f"Remove **{entry.roblox_display_name}** from **#{entry.position}**?",
-            ),
-            view=Top10RemoveConfirmView(
-                service=self.service,
-                logger=self.logger,
-                entry=entry,
-                author_id=self.author_id,
-            ),
-            ephemeral=True,
-        )
-
-
-# ============================================================
-# RESET CONFIRM VIEW
-# ============================================================
-
-
-class Top10ResetConfirmView(discord.ui.View):
-    def __init__(
-        self,
-        *,
-        service: Top10Service,
-        logger: logging.Logger,
-        author_id: int,
-    ) -> None:
-        super().__init__(timeout=120)
-        self.service = service
-        self.logger = logger
-        self.author_id = author_id
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                "❌ This confirmation panel belongs to another administrator.",
-                ephemeral=True,
-            )
-            return False
-        return True
-
-    @discord.ui.button(
-        label="Confirm Reset",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger,
-    )
-    async def confirm_reset(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            deleted_count = await self.service.clear()
-        except Exception:
-            self.logger.exception("Failed to reset Top 10.")
-            await interaction.followup.send(
-                embed=Top10Embeds.error(
-                    "❌ Reset Failed",
-                    "The Top 10 could not be reset.",
-                ),
-                ephemeral=True,
-            )
-            self.stop()
-            return
-
-        await interaction.followup.send(
-            embed=Top10Embeds.success(
-                "✅ Top 10 Reset",
-                f"Successfully removed **{deleted_count}** entries.",
-            ),
-            ephemeral=True,
-        )
-        self.stop()
-
-    @discord.ui.button(
-        label="Cancel",
-        emoji="✖️",
-        style=discord.ButtonStyle.secondary,
-    )
-    async def cancel_reset(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        for child in self.children:
-            child.disabled = True
-
-        await interaction.response.edit_message(
-            content="❎ Reset cancelled.",
-            embed=None,
-            view=None,
-        )
-        self.stop()
 
 
 # ============================================================
@@ -1329,7 +1396,8 @@ class Top10(commands.Cog):
         !top10-remove
         !top10-reset
 
-    Data work is delegated to Top10Service.
+    Storage:
+        Top10Service(database_path=bot.config.database_path, roblox_service=bot.roblox_service)
     """
 
     def __init__(
@@ -1346,91 +1414,84 @@ class Top10(commands.Cog):
     async def _load_entries(self) -> list[Top10Entry]:
         return await self.service.get_all()
 
-    async def _management_embed(self) -> discord.Embed:
-        count = await self.service.count()
-        is_full = await self.service.is_full()
-        return Top10Embeds.management(count, is_full)
-
-    async def _send_ranking(
+    async def _send_ranking_to_interaction(
         self,
-        *,
-        destination: discord.Interaction | commands.Context,
-        ephemeral: bool = False,
+        interaction: discord.Interaction,
     ) -> None:
         try:
             entries = await self._load_entries()
         except Exception:
-            self.logger.exception("Failed to load Top 10.")
-            error_embed = Top10Embeds.error(
-                "❌ Top 10 Unavailable",
-                "The PAG Top 10 could not be loaded right now.",
+            self.logger.exception("Top 10 listesi yüklenemedi.")
+            await interaction.followup.send(
+                embed=Top10Embeds.error(
+                    "❌ Top 10 Ulaşılamıyor",
+                    "PAG Top 10 şu anda yüklenemiyor.",
+                ),
             )
-            if isinstance(destination, discord.Interaction):
-                if destination.response.is_done():
-                    await destination.followup.send(embed=error_embed, ephemeral=ephemeral)
-                else:
-                    await destination.response.send_message(embed=error_embed, ephemeral=ephemeral)
-            else:
-                await destination.send(embed=error_embed)
             return
 
         if not entries:
-            empty_embed = Top10Embeds.empty()
-            if isinstance(destination, discord.Interaction):
-                if destination.response.is_done():
-                    await destination.followup.send(embed=empty_embed, ephemeral=ephemeral)
-                else:
-                    await destination.response.send_message(embed=empty_embed, ephemeral=ephemeral)
-            else:
-                await destination.send(embed=empty_embed)
+            await interaction.followup.send(
+                embed=Top10Embeds.empty(),
+            )
             return
 
-        view = Top10RankingView(
-            entries=entries,
-            service=self.service,
-            author_id=destination.user.id if isinstance(destination, discord.Interaction) else None,
+        await interaction.followup.send(
+            embed=Top10Embeds.player(
+                entries[0],
+                page_index=0,
+                total_pages=len(entries),
+            ),
+            view=Top10RankingView(
+                service=self.service,
+                entries=entries,
+            ),
         )
-        first_embed = Top10Embeds.player(entries[0], page_index=0, total_pages=len(entries))
 
-        if isinstance(destination, discord.Interaction):
-            if destination.response.is_done():
-                await destination.followup.send(embed=first_embed, view=view, ephemeral=ephemeral)
-            else:
-                await destination.response.send_message(embed=first_embed, view=view, ephemeral=ephemeral)
-        else:
-            await destination.send(embed=first_embed, view=view)
+    async def _send_ranking_to_ctx(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        try:
+            entries = await self._load_entries()
+        except Exception:
+            self.logger.exception("Top 10 listesi yüklenemedi.")
+            await ctx.send(
+                embed=Top10Embeds.error(
+                    "❌ Top 10 Ulaşılamıyor",
+                    "PAG Top 10 şu anda yüklenemiyor.",
+                ),
+            )
+            return
 
-    # ========================================================
-    # /TOP10
-    # ========================================================
+        if not entries:
+            await ctx.send(embed=Top10Embeds.empty())
+            return
 
-    @app_commands.command(
-        name="top10",
-        description="Display the official PAG Top 10.",
-    )
-    @app_commands.guild_only()
-    async def top10_slash(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
-        await self._send_ranking(destination=interaction)
+        await ctx.send(
+            embed=Top10Embeds.player(
+                entries[0],
+                page_index=0,
+                total_pages=len(entries),
+            ),
+            view=Top10RankingView(
+                service=self.service,
+                entries=entries,
+            ),
+        )
 
-    @commands.command(name="top10")
-    @commands.guild_only()
-    async def top10_prefix(self, ctx: commands.Context) -> None:
-        await self._send_ranking(destination=ctx)
+    async def _send_management_to_interaction(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        try:
+            count = await self.service.count()
+        except Exception:
+            self.logger.exception("Top 10 count alınamadı.")
+            count = 0
 
-    # ========================================================
-    # /TOP10-SET
-    # ========================================================
-
-    @app_commands.command(
-        name="top10-set",
-        description="Open the PAG Top 10 management panel.",
-    )
-    @app_commands.guild_only()
-    @app_commands.checks.has_permissions(administrator=True)
-    async def top10_set_slash(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
-            embed=await self._management_embed(),
+            embed=Top10Embeds.management(count),
             view=Top10ManagementView(
                 service=self.service,
                 logger=self.logger,
@@ -1439,12 +1500,18 @@ class Top10(commands.Cog):
             ephemeral=True,
         )
 
-    @commands.command(name="top10-set")
-    @commands.guild_only()
-    @commands.has_permissions(administrator=True)
-    async def top10_set_prefix(self, ctx: commands.Context) -> None:
+    async def _send_management_to_ctx(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        try:
+            count = await self.service.count()
+        except Exception:
+            self.logger.exception("Top 10 count alınamadı.")
+            count = 0
+
         await ctx.send(
-            embed=await self._management_embed(),
+            embed=Top10Embeds.management(count),
             view=Top10ManagementView(
                 service=self.service,
                 logger=self.logger,
@@ -1452,51 +1519,404 @@ class Top10(commands.Cog):
             ),
         )
 
+    async def _add_player(
+        self,
+        *,
+        interaction: discord.Interaction | None = None,
+        ctx: commands.Context | None = None,
+        position: int,
+        username: str,
+        rank: str,
+        notes: str | None,
+        added_by: int,
+        replace_existing: bool,
+    ) -> None:
+        username = username.strip()
+        rank = rank.strip()
+        notes = notes.strip() if notes else None
+
+        if interaction is not None:
+            await interaction.response.defer(ephemeral=True)
+        elif ctx is not None:
+            await ctx.trigger_typing()
+
+        try:
+            entry = await self.service.add(
+                position=position,
+                username=username,
+                rank=rank,
+                added_by=added_by,
+                notes=notes,
+                replace_existing=replace_existing,
+            )
+        except (
+            InvalidPositionError,
+            PlayerAlreadyExistsError,
+            PositionOccupiedError,
+            PlayerNotFoundError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(
+                error,
+                position=position,
+                username=username,
+            )
+            embed = Top10Embeds.error(title, description)
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+        except sqlite3.IntegrityError:
+            embed = Top10Embeds.error(
+                "❌ Veritabanı Çakışması",
+                "Kayıt veritabanına yazılamadı.",
+            )
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+        except Exception:
+            self.logger.exception("Top 10 add işlemi beklenmeyen hata verdi.")
+            embed = Top10Embeds.error(
+                "❌ Beklenmeyen Hata",
+                "Oyuncu eklenemedi.",
+            )
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+
+        embed = Top10Embeds.success(
+            "✅ Oyuncu Eklendi",
+            f"**{entry.roblox_display_name}** başarıyla **#{entry.position}** konumuna yazıldı.",
+        )
+        embed.add_field(name="Roblox", value=f"`{entry.roblox_username}`", inline=True)
+        embed.add_field(name="Rank", value=f"`{entry.rank}`", inline=True)
+        embed.add_field(name="User ID", value=f"`{entry.roblox_user_id}`", inline=True)
+
+        if entry.avatar_url:
+            embed.set_thumbnail(url=entry.avatar_url)
+
+        if interaction is not None:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await ctx.send(embed=embed)
+
+    async def _update_player(
+        self,
+        *,
+        interaction: discord.Interaction | None = None,
+        ctx: commands.Context | None = None,
+        position: int,
+        username: str | None,
+        rank: str | None,
+        notes: str | None,
+        new_position: int | None,
+        updated_by: int,
+    ) -> None:
+        if interaction is not None:
+            await interaction.response.defer(ephemeral=True)
+        elif ctx is not None:
+            await ctx.trigger_typing()
+
+        try:
+            entry = await self.service.update(
+                position=position,
+                updated_by=updated_by,
+                username=username,
+                rank=rank,
+                notes=notes,
+                new_position=new_position,
+            )
+        except (
+            InvalidPositionError,
+            PlayerAlreadyExistsError,
+            PositionOccupiedError,
+            PlayerNotFoundError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(
+                error,
+                position=new_position or position,
+                username=username,
+            )
+            embed = Top10Embeds.error(title, description)
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+        except sqlite3.IntegrityError:
+            embed = Top10Embeds.error(
+                "❌ Veritabanı Çakışması",
+                "Güncelleme veritabanına yazılamadı.",
+            )
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+        except Exception:
+            self.logger.exception("Top 10 update işlemi beklenmeyen hata verdi.")
+            embed = Top10Embeds.error(
+                "❌ Beklenmeyen Hata",
+                "Oyuncu güncellenemedi.",
+            )
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+
+        embed = Top10Embeds.success(
+            "✅ Oyuncu Güncellendi",
+            f"**{entry.roblox_display_name}** başarıyla güncellendi.",
+        )
+        embed.add_field(name="Position", value=f"**#{entry.position}**", inline=True)
+        embed.add_field(name="Roblox", value=f"`{entry.roblox_username}`", inline=True)
+        embed.add_field(name="Rank", value=f"`{entry.rank}`", inline=True)
+
+        if entry.avatar_url:
+            embed.set_thumbnail(url=entry.avatar_url)
+
+        if interaction is not None:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await ctx.send(embed=embed)
+
+    async def _remove_player(
+        self,
+        *,
+        interaction: discord.Interaction | None = None,
+        ctx: commands.Context | None = None,
+        position: int,
+        confirm_text: bool = False,
+    ) -> None:
+        if interaction is not None:
+            await interaction.response.defer(ephemeral=True)
+        elif ctx is not None:
+            await ctx.trigger_typing()
+
+        if confirm_text is False and ctx is not None:
+            # Prefix tarafında hızlı ama güvenli akış:
+            # önce mevcut kaydı bulup onay paneli gösteriyoruz.
+            try:
+                entry = await self.service.get_by_position(position)
+            except Exception:
+                self.logger.exception("Silme öncesi pozisyon yüklenemedi.")
+                await ctx.send(
+                    embed=Top10Embeds.error(
+                        "❌ Yükleme Başarısız",
+                        "Oyuncu kontrol edilemedi.",
+                    )
+                )
+                return
+
+            if entry is None:
+                await ctx.send(
+                    embed=Top10Embeds.error(
+                        "❌ Pozisyon Boş",
+                        f"**#{position}** konumunda oyuncu yok.",
+                    )
+                )
+                return
+
+            await ctx.send(
+                embed=Top10Embeds.warning(
+                    "⚠️ Silmeyi Onayla",
+                    f"**{entry.roblox_display_name}** oyuncusu **#{entry.position}** konumundan kaldırılsın mı?",
+                ),
+                view=Top10RemoveConfirmView(
+                    service=self.service,
+                    logger=self.logger,
+                    entry=entry,
+                    author_id=ctx.author.id,
+                ),
+            )
+            return
+
+        try:
+            removed = await self.service.remove(position)
+        except (
+            InvalidPositionError,
+            PlayerNotFoundError,
+            Top10Error,
+        ) as error:
+            title, description = Top10ErrorMapper.map(error, position=position)
+            embed = Top10Embeds.error(title, description)
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+        except Exception:
+            self.logger.exception("Top 10 remove işlemi beklenmeyen hata verdi.")
+            embed = Top10Embeds.error(
+                "❌ Beklenmeyen Hata",
+                "Oyuncu kaldırılamadı.",
+            )
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+
+        embed = Top10Embeds.success(
+            "✅ Oyuncu Kaldırıldı",
+            f"**{removed.roblox_display_name}** başarıyla **#{removed.position}** konumundan kaldırıldı.",
+        )
+
+        if interaction is not None:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await ctx.send(embed=embed)
+
+    async def _reset_top10(
+        self,
+        *,
+        interaction: discord.Interaction | None = None,
+        ctx: commands.Context | None = None,
+        confirm_text: bool = False,
+    ) -> None:
+        if interaction is not None:
+            await interaction.response.defer(ephemeral=True)
+        elif ctx is not None:
+            await ctx.trigger_typing()
+
+        if not confirm_text:
+            if ctx is not None:
+                await ctx.send(
+                    embed=Top10Embeds.warning(
+                        "⚠️ Top 10 Sıfırlansın mı?",
+                        "Bu işlem listedeki tüm oyuncuları siler.\n\nDevam etmek için onay ver.",
+                    ),
+                    view=Top10ResetConfirmView(
+                        service=self.service,
+                        logger=self.logger,
+                        author_id=ctx.author.id,
+                    ),
+                )
+                return
+
+            if interaction is not None:
+                await interaction.followup.send(
+                    embed=Top10Embeds.warning(
+                        "⚠️ Top 10 Sıfırlansın mı?",
+                        "Bu işlem listedeki tüm oyuncuları siler.\n\nDevam etmek için onay ver.",
+                    ),
+                    view=Top10ResetConfirmView(
+                        service=self.service,
+                        logger=self.logger,
+                        author_id=interaction.user.id,
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+        try:
+            deleted_count = await self.service.clear()
+        except Exception:
+            self.logger.exception("Top 10 reset işlemi beklenmeyen hata verdi.")
+            embed = Top10Embeds.error(
+                "❌ Reset Başarısız",
+                "Top 10 listesi sıfırlanamadı.",
+            )
+            if interaction is not None:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await ctx.send(embed=embed)
+            return
+
+        embed = Top10Embeds.success(
+            "✅ Top 10 Sıfırlandı",
+            f"Listeden **{deleted_count}** kayıt silindi.",
+        )
+        if interaction is not None:
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        else:
+            await ctx.send(embed=embed)
+
     # ========================================================
-    # /TOP10-EDIT
+    # SLASH COMMANDS
     # ========================================================
+
+    @app_commands.command(
+        name="top10",
+        description="PAG Top 10 listesini gösterir.",
+    )
+    @app_commands.guild_only()
+    async def top10(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer()
+        await self._send_ranking_to_interaction(interaction)
+
+    @app_commands.command(
+        name="top10-set",
+        description="Top 10 yönetim panelini açar.",
+    )
+    @app_commands.guild_only()
+    @app_commands.checks.has_permissions(administrator=True)
+    async def top10_set(self, interaction: discord.Interaction) -> None:
+        await self._send_management_to_interaction(interaction)
 
     @app_commands.command(
         name="top10-edit",
-        description="Edit an existing Top 10 player.",
+        description="Top 10 içindeki bir oyuncuyu düzenler.",
+    )
+    @app_commands.describe(
+        position="Düzenlenecek mevcut pozisyon.",
+        username="Yeni Roblox kullanıcı adı.",
+        rank="Yeni PAG rank.",
+        new_position="Yeni pozisyon.",
+        notes="Yeni not.",
     )
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
-    async def top10_edit_slash(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_modal(
-            Top10EditModal(
-                service=self.service,
-                logger=self.logger,
-                updated_by=interaction.user.id,
+    async def top10_edit(
+        self,
+        interaction: discord.Interaction,
+        position: int,
+        username: str | None = None,
+        rank: str | None = None,
+        new_position: int | None = None,
+        notes: str | None = None,
+    ) -> None:
+        if username is None and rank is None and new_position is None and notes is None:
+            await interaction.response.send_modal(
+                Top10EditModal(
+                    service=self.service,
+                    logger=self.logger,
+                    updated_by=interaction.user.id,
+                )
             )
-        )
+            return
 
-    @commands.command(name="top10-edit")
-    @commands.guild_only()
-    @commands.has_permissions(administrator=True)
-    async def top10_edit_prefix(self, ctx: commands.Context) -> None:
-        # Prefix cannot open a modal directly, so it opens the same
-        # admin panel used for all management actions.
-        await ctx.send(
-            embed=await self._management_embed(),
-            view=Top10ManagementView(
-                service=self.service,
-                logger=self.logger,
-                author_id=ctx.author.id,
-            ),
+        await self._update_player(
+            interaction=interaction,
+            position=position,
+            username=username,
+            rank=rank,
+            notes=notes,
+            new_position=new_position,
+            updated_by=interaction.user.id,
         )
-
-    # ========================================================
-    # /TOP10-REMOVE
-    # ========================================================
 
     @app_commands.command(
         name="top10-remove",
-        description="Remove a Top 10 player.",
+        description="Top 10 içindeki bir oyuncuyu kaldırır.",
+    )
+    @app_commands.describe(
+        position="Kaldırılacak pozisyon.",
     )
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
-    async def top10_remove_slash(self, interaction: discord.Interaction) -> None:
+    async def top10_remove(
+        self,
+        interaction: discord.Interaction,
+        position: int,
+    ) -> None:
         await interaction.response.send_modal(
             Top10RemoveModal(
                 service=self.service,
@@ -1505,34 +1925,17 @@ class Top10(commands.Cog):
             )
         )
 
-    @commands.command(name="top10-remove")
-    @commands.guild_only()
-    @commands.has_permissions(administrator=True)
-    async def top10_remove_prefix(self, ctx: commands.Context) -> None:
-        await ctx.send(
-            embed=await self._management_embed(),
-            view=Top10ManagementView(
-                service=self.service,
-                logger=self.logger,
-                author_id=ctx.author.id,
-            ),
-        )
-
-    # ========================================================
-    # /TOP10-RESET
-    # ========================================================
-
     @app_commands.command(
         name="top10-reset",
-        description="Reset the entire Top 10.",
+        description="PAG Top 10 listesini sıfırlar.",
     )
     @app_commands.guild_only()
     @app_commands.checks.has_permissions(administrator=True)
-    async def top10_reset_slash(self, interaction: discord.Interaction) -> None:
+    async def top10_reset(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             embed=Top10Embeds.warning(
-                "⚠️ Reset PAG Top 10?",
-                "This will remove every player from the ranking.\n\nThis action cannot be undone.",
+                "⚠️ Top 10 Sıfırlansın mı?",
+                "Bu işlem listedeki tüm oyuncuları siler.\n\nDevam etmek için onay ver.",
             ),
             view=Top10ResetConfirmView(
                 service=self.service,
@@ -1542,24 +1945,107 @@ class Top10(commands.Cog):
             ephemeral=True,
         )
 
+    # ========================================================
+    # PREFIX COMMANDS
+    # ========================================================
+
+    @commands.command(name="top10")
+    @commands.guild_only()
+    async def top10_prefix(self, ctx: commands.Context) -> None:
+        await self._send_ranking_to_ctx(ctx)
+
+    @commands.command(name="top10-set")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def top10_set_prefix(
+        self,
+        ctx: commands.Context,
+        position: int | None = None,
+        username: str | None = None,
+        rank: str | None = None,
+        replace_existing: bool = False,
+        *,
+        notes: str | None = None,
+    ) -> None:
+        if position is None or username is None or rank is None:
+            await self._send_management_to_ctx(ctx)
+            return
+
+        await self._add_player(
+            ctx=ctx,
+            position=position,
+            username=username,
+            rank=rank,
+            notes=notes,
+            added_by=ctx.author.id,
+            replace_existing=replace_existing,
+        )
+
+    @commands.command(name="top10-edit")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def top10_edit_prefix(
+        self,
+        ctx: commands.Context,
+        position: int | None = None,
+        username: str | None = None,
+        rank: str | None = None,
+        new_position: int | None = None,
+        *,
+        notes: str | None = None,
+    ) -> None:
+        if position is None:
+            await self._send_management_to_ctx(ctx)
+            return
+
+        if username is None and rank is None and new_position is None and notes is None:
+            await self._send_management_to_ctx(ctx)
+            return
+
+        await self._update_player(
+            ctx=ctx,
+            position=position,
+            username=username,
+            rank=rank,
+            notes=notes,
+            new_position=new_position,
+            updated_by=ctx.author.id,
+        )
+
+    @commands.command(name="top10-remove")
+    @commands.guild_only()
+    @commands.has_permissions(administrator=True)
+    async def top10_remove_prefix(
+        self,
+        ctx: commands.Context,
+        position: int | None = None,
+        confirm: str | bool = False,
+    ) -> None:
+        if position is None:
+            await self._send_management_to_ctx(ctx)
+            return
+
+        await self._remove_player(
+            ctx=ctx,
+            position=position,
+            confirm_text=_is_true_like(confirm),
+        )
+
     @commands.command(name="top10-reset")
     @commands.guild_only()
     @commands.has_permissions(administrator=True)
-    async def top10_reset_prefix(self, ctx: commands.Context) -> None:
-        await ctx.send(
-            embed=Top10Embeds.warning(
-                "⚠️ Reset PAG Top 10?",
-                "This will remove every player from the ranking.\n\nThis action cannot be undone.",
-            ),
-            view=Top10ResetConfirmView(
-                service=self.service,
-                logger=self.logger,
-                author_id=ctx.author.id,
-            ),
+    async def top10_reset_prefix(
+        self,
+        ctx: commands.Context,
+        confirm: str | bool = False,
+    ) -> None:
+        await self._reset_top10(
+            ctx=ctx,
+            confirm_text=_is_true_like(confirm),
         )
 
     # ========================================================
-    # ERROR HANDLERS
+    # ERROR HANDLING
     # ========================================================
 
     async def cog_app_command_error(
@@ -1568,10 +2054,10 @@ class Top10(commands.Cog):
         error: app_commands.AppCommandError,
     ) -> None:
         if isinstance(error, app_commands.MissingPermissions):
-            message = "❌ You need **Administrator** permission to use this command."
+            message = "❌ Bu komut için Administrator yetkisi gerekir."
         else:
-            self.logger.exception("Top 10 slash command error.")
-            message = "❌ An unexpected error occurred while processing this command."
+            self.logger.exception("Top 10 slash komut hatası.")
+            message = "❌ İşlem sırasında beklenmeyen bir hata oluştu."
 
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
@@ -1586,8 +2072,8 @@ class Top10(commands.Cog):
         if isinstance(error, commands.MissingPermissions):
             await ctx.send(
                 embed=Top10Embeds.error(
-                    "❌ Missing Permissions",
-                    "You need **Administrator** permission to use this command.",
+                    "❌ Yetki Eksik",
+                    "Bu komut için Administrator yetkisi gerekir.",
                 ),
                 delete_after=8,
             )
@@ -1596,11 +2082,11 @@ class Top10(commands.Cog):
         if isinstance(error, commands.CommandNotFound):
             return
 
-        self.logger.exception("Top 10 prefix command error.")
+        self.logger.exception("Top 10 prefix komut hatası.")
         await ctx.send(
             embed=Top10Embeds.error(
-                "❌ Command Error",
-                "An unexpected error occurred while processing the command.",
+                "❌ Komut Hatası",
+                "İşlem sırasında beklenmeyen bir hata oluştu.",
             ),
             delete_after=8,
         )
