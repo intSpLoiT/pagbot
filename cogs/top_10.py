@@ -779,4 +779,64 @@ class Top10(commands.Cog):
             message = (
                 "❌ Bu komutu kullanmak için "
                 "**Administrator** yetkisine "
-                "sahip olmalısın.")
+                "sahip olmalısın."
+            )
+
+            if interaction.response.is_done():
+                await interaction.followup.send(
+                    message,
+                    ephemeral=True,
+                )
+
+            else:
+                await interaction.response.send_message(
+                    message,
+                    ephemeral=True,
+                )
+
+            return
+
+        self.logger.error(
+            "Top 10 command error: %s",
+            error,
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
+            ),
+        )
+
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                (
+                    "❌ Top 10 komutu çalıştırılırken "
+                    "beklenmeyen bir hata oluştu."
+                ),
+                ephemeral=True,
+            )
+
+        else:
+            await interaction.response.send_message(
+                (
+                    "❌ Top 10 komutu çalıştırılırken "
+                    "beklenmeyen bir hata oluştu."
+                ),
+                ephemeral=True,
+            )
+
+
+# ============================================================
+# SETUP
+# ============================================================
+
+
+async def setup(
+    bot: commands.Bot,
+) -> None:
+    await bot.add_cog(
+        Top10(
+            bot,
+            top10_service=bot.top10_service,
+            logger=bot.logger,
+        )
+    )
