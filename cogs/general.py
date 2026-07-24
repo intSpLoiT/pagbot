@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import random
-from typing import Any
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from services.event_service import EventService
-from services.roblox_service import (
-    RobloxAPIError,
-    RobloxNotFoundError,
-    RobloxService,
-)
 from utils.embeds import PAGEmbeds
 
 
@@ -34,12 +27,10 @@ class General(commands.Cog):
         self,
         bot: commands.Bot,
         *,
-        roblox_service: RobloxService,
         event_service: EventService,
         logger: logging.Logger,
     ) -> None:
         self.bot = bot
-        self.roblox_service = roblox_service
         self.event_service = event_service
         self.logger = logger
 
@@ -57,7 +48,7 @@ class General(commands.Cog):
         interaction: discord.Interaction,
     ) -> None:
         """
-        Kullanıcının Discord ve Roblox profilini gösterir.
+        Kullanıcının Discord profilini gösterir.
         """
 
         await interaction.response.defer()
@@ -65,10 +56,10 @@ class General(commands.Cog):
         member = interaction.user
 
         embed = discord.Embed(
-            title=f"👤 {member.display_name}'s Profile",
-            description=(
-                "PAG member profile"
+            title=(
+                f"👤 {member.display_name}'s Profile"
             ),
+            description="PAG member profile",
             timestamp=discord.utils.utcnow(),
         )
 
@@ -87,7 +78,7 @@ class General(commands.Cog):
         )
 
         embed.add_field(
-            name="Joined Discord",
+            name="Account Created",
             value=discord.utils.format_dt(
                 member.created_at,
                 style="R",
@@ -97,17 +88,7 @@ class General(commands.Cog):
 
         embed.add_field(
             name="Roles",
-            value=(
-                str(
-                    len(
-                        getattr(
-                            member,
-                            "roles",
-                            [],
-                        )
-                    )
-                )
-            ),
+            value=f"`{len(member.roles) - 1}`",
             inline=True,
         )
 
@@ -193,9 +174,7 @@ class General(commands.Cog):
             )
 
             embed.add_field(
-                name=(
-                    f"📌 {event_name}"
-                ),
+                name=f"📌 {event_name}",
                 value=(
                     f"{event_description[:500]}\n"
                     f"ID: `{event_id}`"
@@ -232,17 +211,20 @@ class General(commands.Cog):
 
         roles = [
             role.mention
-            for role in member.roles[1:]
+            for role in member.roles
+            if role != interaction.guild.default_role
         ]
 
-        roles_text = (
-            " ".join(roles[:15])
-            if roles
-            else "Rol yok"
-        )
+        if roles:
+            roles_text = " ".join(roles[:15])
+
+        else:
+            roles_text = "Rol yok"
 
         embed = discord.Embed(
-            title=f"👤 {member.display_name}",
+            title=(
+                f"👤 {member.display_name}"
+            ),
             timestamp=discord.utils.utcnow(),
         )
 
@@ -322,13 +304,15 @@ class General(commands.Cog):
         total_events = 0
 
         try:
-            active = (
+            active_events_data = (
                 await self.event_service.list_events(
                     status="active",
                 )
             )
 
-            active_events = len(active)
+            active_events = len(
+                active_events_data,
+            )
 
         except Exception:
             self.logger.exception(
@@ -340,7 +324,9 @@ class General(commands.Cog):
                 await self.event_service.list_events()
             )
 
-            total_events = len(all_events)
+            total_events = len(
+                all_events,
+            )
 
         except Exception:
             self.logger.exception(
@@ -354,7 +340,9 @@ class General(commands.Cog):
 
         embed.add_field(
             name="👥 Members",
-            value=f"`{guild.member_count or 0}`",
+            value=(
+                f"`{guild.member_count or 0}`"
+            ),
             inline=True,
         )
 
@@ -370,11 +358,10 @@ class General(commands.Cog):
             inline=True,
         )
 
-        embed.set_thumbnail(
-            url=guild.icon.url
-            if guild.icon
-            else discord.Embed.Empty,
-        )
+        if guild.icon:
+            embed.set_thumbnail(
+                url=guild.icon.url,
+            )
 
         await interaction.followup.send(
             embed=embed,
@@ -432,7 +419,7 @@ class General(commands.Cog):
         embed = discord.Embed(
             title="🎲 PAG Random Selection",
             description=(
-                f"🎉 Seçilen üye:\n\n"
+                "🎉 Seçilen üye:\n\n"
                 f"## {selected.mention}"
             ),
             timestamp=discord.utils.utcnow(),
@@ -459,9 +446,14 @@ class General(commands.Cog):
         Genel slash command hata yöneticisi.
         """
 
-        self.logger.exception(
+        self.logger.error(
             "General command error: %s",
             error,
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
+            ),
         )
 
         message = (
@@ -493,7 +485,6 @@ async def setup(
     await bot.add_cog(
         General(
             bot,
-            roblox_service=bot.roblox_service,
             event_service=bot.event_service,
             logger=bot.logger,
         )
