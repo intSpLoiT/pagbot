@@ -1,244 +1,74 @@
 from __future__ import annotations
 
 import asyncio
-import importlib.util
 import logging
-import os
 import signal
-import subprocess
 import sys
 import threading
 import time
-from collections import deque
-from dataclasses import dataclass
-from pathlib import Path
 from types import FrameType
 from typing import Final
 
-from flask import Flask, jsonify
+from flask import Flask
+from flask import Response
+from flask import jsonify
+
+from config.config import load_config
+from core.bot import PAGBot
+from core.logger import setup_logger
 
 
 # ============================================================
-# PROJECT CONSTANTS
+# APPLICATION CONSTANTS
 # ============================================================
-
-PROJECT_ROOT: Final[Path] = (
-    Path(__file__).resolve().parent
-)
-
-REQUIREMENTS_FILE: Final[Path] = (
-    PROJECT_ROOT / "requirements.txt"
-)
 
 DEFAULT_PORT: Final[int] = 10000
 
-LOG_BUFFER_SIZE: Final[int] = 100
+WEB_SERVER_START_TIMEOUT: Final[float] = 10.0
 
-STARTUP_TIMEOUT: Final[float] = 120.0
+BOT_RESTART_DELAY: Final[float] = 10.0
+
+MAX_BOT_RESTART_DELAY: Final[float] = 60.0
 
 SHUTDOWN_TIMEOUT: Final[float] = 20.0
 
-
-# ============================================================
-# ENVIRONMENT HELPERS
-# ============================================================
-
-def get_port() -> int:
-    """
-    Render tarafından verilen PORT değişkenini alır.
-
-    Render:
-        PORT=10000
-
-    Local:
-        PORT yoksa 10000 kullanılır.
-    """
-
-    raw_port = os.getenv(
-        "PORT",
-        str(DEFAULT_PORT),
-    ).strip()
-
-    try:
-
-        port = int(raw_port)
-
-    except ValueError:
-
-        port = DEFAULT_PORT
-
-    if not 1 <= port <= 65535:
-
-        return DEFAULT_PORT
-
-    return port
+LOG_BUFFER_SIZE: Final[int] = 100
 
 
 # ============================================================
-# RUNTIME DEPENDENCY BOOTSTRAP
+# GLOBAL APPLICATION STATE
 # ============================================================
 
-@dataclass(slots=True, frozen=True)
-class DependencySpec:
-    """
-    Runtime dependency bilgisi.
-    """
+_shutdown_event: asyncio.Event | None = None
 
-    package_name: str
-    import_name: str
+_bot: PAGBot | None = None
 
+_logger: logging.Logger | None = None
 
-RUNTIME_DEPENDENCIES: Final[
-    tuple[DependencySpec, ...]
-] = (
-    DependencySpec(
-        package_name="flask",
-        import_name="flask",
-    ),
-    DependencySpec(
-        package_name="discord.py",
-        import_name="discord",
-    ),
-    DependencySpec(
-        package_name="aiosqlite",
-        import_name="aiosqlite",
-    ),
-    DependencySpec(
-        package_name="httpx",
-        import_name="httpx",
-    ),
-    DependencySpec(
-        package_name="python-dotenv",
-        import_name="dotenv",
-    ),
-)
+_application_started_at: float | None = None
 
+_bot_started_at: float | None = None
 
-def _is_package_available(
-    import_name: str,
-) -> bool:
-    """
-    Bir Python paketinin import edilebilir olup
-    olmadığını kontrol eder.
-    """
+_bot_ready: bool = False
 
-    return (
-        importlib.util.find_spec(
-            import_name,
-        )
-        is not None
-    )
+_shutdown_requested: bool = False
 
-
-def _install_package(
-    package_name: str,
-) -> None:
-    """
-    Eksik paketi mevcut Python interpreter'ı
-    kullanarak yükler.
-    """
-
-    subprocess.check_call(
-        [
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "--disable-pip-version-check",
-            "--no-input",
-            package_name,
-        ],
-        cwd=PROJECT_ROOT,
-    )
-
-
-def ensure_runtime_dependencies() -> None:
-    """
-    Kritik paketler eksikse yüklemeyi dener.
-
-    Öncelik:
-        1. requirements.txt
-        2. Eksik temel paketler için fallback
-
-    Render'da normalde requirements.txt build
-    sırasında kurulacağı için bu fonksiyon çoğunlukla
-    herhangi bir işlem yapmaz.
-    """
-
-    missing_packages: list[str] = []
-
-    for dependency in RUNTIME_DEPENDENCIES:
-
-        if not _is_package_available(
-            dependency.import_name,
-        ):
-
-            missing_packages.append(
-                dependency.package_name,
-            )
-
-    if not missing_packages:
-
-        return
-
-    print(
-        "Missing runtime dependencies detected:",
-        ", ".join(missing_packages),
-        flush=True,
-    )
-
-    # Öncelik requirements.txt
-    if REQUIREMENTS_FILE.exists():
-
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--disable-pip-version-check",
-                "--no-input",
-                "-r",
-                str(REQUIREMENTS_FILE),
-            ],
-            cwd=PROJECT_ROOT,
-        )
-
-    else:
-
-        for package in missing_packages:
-
-            _install_package(
-                package,
-            )
+_web_server_started: bool = False
 
 
 # ============================================================
-# DEPENDENCY BOOTSTRAP
+# IN-MEMORY LOG BUFFER
 # ============================================================
 
-# Flask import edilmeden önce dependency kontrolü
-ensure_runtime_dependencies()
-
-
-# ============================================================
-# APPLICATION IMPORTS
-# ============================================================
-
-from flask import Response
-
-
-# ============================================================
-# LOG BUFFER
-# ============================================================
-
-class LogBuffer(logging.Handler):
+class MemoryLogHandler(logging.Handler):
     """
-    Son log kayıtlarını RAM içinde tutar.
+    Son log kayıtlarını RAM içerisinde tutar.
 
     Amaç:
         /logs endpoint'i üzerinden
-        küçük bir debug çıktısı göstermek.
+        küçük bir debug çıktısı sunmak.
+
+    Disk kullanımını artırmaz.
     """
 
     def __init__(
@@ -248,11 +78,14 @@ class LogBuffer(logging.Handler):
 
         super().__init__()
 
-        self._records: deque[str] = deque(
-            maxlen=max_entries,
+        self._records: list[str] = []
+
+        self._max_entries = max(
+            1,
+            max_entries,
         )
 
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def emit(
         self,
@@ -268,7 +101,7 @@ class LogBuffer(logging.Handler):
         except Exception:
 
             message = (
-                "Failed to format log record."
+                "Unable to format log record."
             )
 
         with self._lock:
@@ -277,7 +110,15 @@ class LogBuffer(logging.Handler):
                 message,
             )
 
-    def get_logs(
+            if len(
+                self._records,
+            ) > self._max_entries:
+
+                del self._records[
+                    :-self._max_entries
+                ]
+
+    def get_records(
         self,
     ) -> list[str]:
 
@@ -295,131 +136,158 @@ class LogBuffer(logging.Handler):
 
 
 # ============================================================
-# LOGGER
+# RUNTIME LOGGING
 # ============================================================
 
-class RuntimeLogger:
+_memory_log_handler: MemoryLogHandler | None = None
+
+
+def initialize_logger(
+    log_file=None,
+) -> logging.Logger:
     """
-    Console + RAM log buffer kullanan logger sistemi.
+    PAG logger'ını başlatır.
+
+    core.logger.setup_logger mevcut sistemin
+    ana logger setup fonksiyonudur.
+
+    Burada yalnızca RAM log buffer eklenir.
     """
 
-    def __init__(self) -> None:
+    global _logger
+    global _memory_log_handler
 
-        self.logger = logging.getLogger(
-            "PAG",
-        )
+    if _logger is not None:
 
-        self.logger.setLevel(
-            logging.INFO,
-        )
+        return _logger
 
-        self.logger.propagate = False
+    logger = setup_logger(
+        name="PAG",
+        log_file=log_file,
+    )
 
-        self.log_buffer = LogBuffer(
+    memory_handler = (
+        MemoryLogHandler(
             max_entries=LOG_BUFFER_SIZE,
         )
+    )
 
-        formatter = logging.Formatter(
-            fmt=(
-                "%(asctime)s | "
-                "%(levelname)-8s | "
-                "%(name)s | "
-                "%(message)s"
-            ),
-            datefmt=(
-                "%Y-%m-%d %H:%M:%S"
-            ),
-        )
+    formatter = logging.Formatter(
+        fmt=(
+            "%(asctime)s | "
+            "%(levelname)-8s | "
+            "%(name)s | "
+            "%(message)s"
+        ),
+        datefmt=(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+    )
 
-        self.log_buffer.setFormatter(
-            formatter,
-        )
+    memory_handler.setFormatter(
+        formatter,
+    )
 
-        # Duplicate handler önleme
-        if not self.logger.handlers:
+    logger.addHandler(
+        memory_handler,
+    )
 
-            console_handler = (
-                logging.StreamHandler(
-                    sys.stdout,
-                )
-            )
+    _memory_log_handler = (
+        memory_handler
+    )
 
-            console_handler.setLevel(
-                logging.INFO,
-            )
+    _logger = logger
 
-            console_handler.setFormatter(
-                formatter,
-            )
+    return logger
 
-            self.logger.addHandler(
-                console_handler,
-            )
-
-            self.logger.addHandler(
-                self.log_buffer,
-            )
-
-        else:
-
-            # Eğer logger daha önce oluşturulduysa
-            # log buffer handler'ını eksikse ekle.
-            if self.log_buffer not in (
-                self.logger.handlers
-            ):
-
-                self.logger.addHandler(
-                    self.log_buffer,
-                )
-
-
-# ============================================================
-# GLOBAL APPLICATION STATE
-# ============================================================
-
-_runtime_logger: RuntimeLogger | None = None
-
-_shutdown_event: asyncio.Event | None = None
-
-_bot = None
-
-_bot_ready: bool = False
-
-_bot_started_at: float | None = None
-
-_http_server_started_at: float | None = None
-
-
-# ============================================================
-# LOGGER ACCESSOR
-# ============================================================
 
 def get_logger() -> logging.Logger:
     """
-    PAG logger'ını döndürür.
+    Başlatılmış PAG logger'ını döndürür.
     """
 
-    if _runtime_logger is None:
+    if _logger is None:
 
         raise RuntimeError(
-            "Runtime logger has not been initialized."
+            "PAG logger has not been initialized."
         )
 
-    return _runtime_logger.logger
+    return _logger
 
 
 # ============================================================
-# FLASK APPLICATION
+# ENVIRONMENT
+# ============================================================
+
+def get_port() -> int:
+    """
+    Hosting platformunun PORT değişkenini alır.
+
+    Render:
+        PORT=10000
+
+    Local:
+        PORT yoksa 10000 kullanılır.
+    """
+
+    import os
+
+    raw_port = os.getenv(
+        "PORT",
+        str(DEFAULT_PORT),
+    ).strip()
+
+    try:
+
+        port = int(
+            raw_port,
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return DEFAULT_PORT
+
+    if not 1 <= port <= 65535:
+
+        return DEFAULT_PORT
+
+    return port
+
+
+# ============================================================
+# UPTIME
+# ============================================================
+
+def get_uptime() -> int:
+    """
+    Uygulamanın çalışma süresini saniye
+    olarak döndürür.
+    """
+
+    if _application_started_at is None:
+
+        return 0
+
+    return max(
+        0,
+        int(
+            time.monotonic()
+            - _application_started_at,
+        ),
+    )
+
+
+# ============================================================
+# FLASK HEALTH SERVER
 # ============================================================
 
 app = Flask(
-    "pag-bot-health",
+    "pag-health",
 )
 
-
-# ============================================================
-# HEALTH ROUTE
-# ============================================================
 
 @app.get("/")
 def index() -> Response:
@@ -430,21 +298,21 @@ def index() -> Response:
     return jsonify(
         {
             "service": "PAG Bot",
-            "status": "online",
+            "status": (
+                "online"
+                if _bot_ready
+                else "starting"
+            ),
             "bot_ready": _bot_ready,
-            "uptime": _get_uptime(),
+            "uptime": get_uptime(),
         }
     )
 
 
-# ============================================================
-# HEALTH ROUTE
-# ============================================================
-
 @app.get("/health")
 def health() -> Response:
     """
-    Render health check endpoint'i.
+    Hosting health check endpoint'i.
     """
 
     if _bot_ready:
@@ -453,7 +321,7 @@ def health() -> Response:
             {
                 "status": "healthy",
                 "bot": "ready",
-                "uptime": _get_uptime(),
+                "uptime": get_uptime(),
             }
         ), 200
 
@@ -461,43 +329,10 @@ def health() -> Response:
         {
             "status": "starting",
             "bot": "starting",
-            "uptime": _get_uptime(),
+            "uptime": get_uptime(),
         }
     ), 200
 
-
-# ============================================================
-# LOG ROUTE
-# ============================================================
-
-@app.get("/logs")
-def logs() -> Response:
-    """
-    Son RAM loglarını döndürür.
-    """
-
-    if _runtime_logger is None:
-
-        return jsonify(
-            {
-                "logs": [],
-            }
-        )
-
-    return jsonify(
-        {
-            "logs": (
-                _runtime_logger
-                .log_buffer
-                .get_logs()
-            ),
-        }
-    )
-
-
-# ============================================================
-# STATUS ROUTE
-# ============================================================
 
 @app.get("/status")
 def status() -> Response:
@@ -508,68 +343,106 @@ def status() -> Response:
     return jsonify(
         {
             "service": "PAG Bot",
-            "bot_ready": _bot_ready,
-            "bot_started": (
+            "bot_created": (
                 _bot is not None
             ),
-            "uptime": _get_uptime(),
+            "bot_ready": _bot_ready,
+            "shutdown_requested": (
+                _shutdown_requested
+            ),
+            "web_server_started": (
+                _web_server_started
+            ),
+            "uptime": get_uptime(),
         }
     )
 
 
-# ============================================================
-# UPTIME
-# ============================================================
-
-def _get_uptime() -> int:
+@app.get("/logs")
+def logs() -> Response:
     """
-    Process uptime'ını saniye olarak döndürür.
+    Son RAM loglarını döndürür.
     """
 
-    if _http_server_started_at is None:
+    if _memory_log_handler is None:
 
-        return 0
+        return jsonify(
+            {
+                "logs": [],
+            }
+        )
 
-    return max(
-        0,
-        int(
-            time.monotonic()
-            - _http_server_started_at
-        ),
+    return jsonify(
+        {
+            "logs": (
+                _memory_log_handler
+                .get_records()
+            ),
+        }
     )
 
-
-# ============================================================
-# WEB SERVER
-# ============================================================
 
 def run_web_server(
     port: int,
 ) -> None:
     """
-    Flask health server'ını başlatır.
+    Health server'ı çalıştırır.
 
-    Flask development reloader kapalıdır.
-    Aksi halde Render'da ikinci process oluşabilir.
+    Reloader kapalıdır.
+    Böylece ikinci bir process oluşturulmaz.
     """
 
-    global _http_server_started_at
+    global _web_server_started
 
-    _http_server_started_at = (
-        time.monotonic()
+    try:
+
+        _web_server_started = True
+
+        app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+
+    except Exception as error:
+
+        _web_server_started = False
+
+        logger = _logger
+
+        if logger is not None:
+
+            logger.exception(
+                "Health server crashed: %s",
+                error,
+            )
+
+
+def start_web_server() -> threading.Thread:
+    """
+    Flask health server'ını daemon thread olarak başlatır.
+    """
+
+    port = get_port()
+
+    web_thread = threading.Thread(
+        target=run_web_server,
+        args=(
+            port,
+        ),
+        name="PAG-Health-Server",
+        daemon=True,
     )
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False,
-        threaded=True,
-    )
+    web_thread.start()
+
+    return web_thread
 
 
 # ============================================================
-# SIGNAL HANDLER
+# SIGNAL HANDLING
 # ============================================================
 
 def _handle_shutdown_signal(
@@ -580,24 +453,40 @@ def _handle_shutdown_signal(
     SIGINT / SIGTERM sinyallerini yakalar.
     """
 
+    global _shutdown_requested
+
+    _shutdown_requested = True
+
     event = _shutdown_event
 
     if event is None:
 
         return
 
-    if event.is_set():
+    try:
+
+        loop = event._loop
+
+    except AttributeError:
 
         return
 
-    event.set()
+    if loop.is_closed():
+
+        return
+
+    try:
+
+        loop.call_soon_threadsafe(
+            event.set,
+        )
+
+    except RuntimeError:
+
+        return
 
 
-# ============================================================
-# SIGNAL REGISTRATION
-# ============================================================
-
-def _register_signal_handlers(
+def register_signal_handlers(
     loop: asyncio.AbstractEventLoop,
 ) -> None:
     """
@@ -627,60 +516,157 @@ def _register_signal_handlers(
             RuntimeError,
         ):
 
-            signal.signal(
-                sig,
-                _handle_shutdown_signal,
+            try:
+
+                signal.signal(
+                    sig,
+                    _handle_shutdown_signal,
+                )
+
+            except (
+                ValueError,
+                OSError,
+            ):
+
+                # Bazı hosting ortamlarında
+                # signal kurulumu desteklenmeyebilir.
+                pass
+
+
+# ============================================================
+# BOT STATE
+# ============================================================
+
+def update_bot_ready_state() -> bool:
+    """
+    Botun hazır olup olmadığını kontrol eder.
+    """
+
+    global _bot_ready
+
+    if _bot is None:
+
+        _bot_ready = False
+
+        return False
+
+    try:
+
+        is_ready = getattr(
+            _bot,
+            "is_ready",
+            None,
+        )
+
+        if callable(
+            is_ready,
+        ):
+
+            _bot_ready = bool(
+                is_ready(),
             )
 
+            return _bot_ready
+
+    except Exception:
+
+        _bot_ready = False
+
+        return False
+
+    _bot_ready = False
+
+    return False
+
 
 # ============================================================
-# BOT CREATION
+# BOT SHUTDOWN
 # ============================================================
 
-def _create_bot(
-    config,
-    logger: logging.Logger,
-):
+async def close_bot() -> None:
     """
-    PAGBot instance'ı oluşturur.
-
-    Import burada yapılır.
-    Böylece başlangıçta bütün bot modülleri
-    main.py import edilir edilmez yüklenmez.
+    Botu güvenli şekilde kapatır.
     """
 
-    from core.bot import PAGBot
+    global _bot
+    global _bot_ready
 
-    return PAGBot(
-        config=config,
-        logger=logger,
-    )
+    _bot_ready = False
+
+    if _bot is None:
+
+        return
+
+    try:
+
+        is_closed = getattr(
+            _bot,
+            "is_closed",
+            None,
+        )
+
+        if callable(
+            is_closed,
+        ):
+
+            if is_closed():
+
+                return
+
+        await asyncio.wait_for(
+            _bot.close(),
+            timeout=SHUTDOWN_TIMEOUT,
+        )
+
+    except asyncio.TimeoutError:
+
+        logger = _logger
+
+        if logger is not None:
+
+            logger.error(
+                "Bot shutdown timed out.",
+            )
+
+    except asyncio.CancelledError:
+
+        raise
+
+    except Exception:
+
+        logger = _logger
+
+        if logger is not None:
+
+            logger.exception(
+                "Failed to close bot cleanly.",
+            )
 
 
 # ============================================================
 # BOT RUNNER
 # ============================================================
 
-async def run_bot() -> None:
+async def run_bot_once() -> None:
     """
-    Discord bot yaşam döngüsü.
+    Botu tek bir kez başlatır.
+
+    Bot class'ı burada oluşturulur.
     """
 
     global _bot
     global _bot_ready
     global _bot_started_at
 
-    from config.config import load_config
-
     config = load_config()
 
     logger = get_logger()
 
     logger.info(
-        "Loading PAG Bot...",
+        "Creating PAG Bot instance...",
     )
 
-    _bot = _create_bot(
+    _bot = PAGBot(
         config=config,
         logger=logger,
     )
@@ -689,17 +675,15 @@ async def run_bot() -> None:
         time.monotonic()
     )
 
-    try:
+    logger.info(
+        "Connecting to Discord...",
+    )
 
-        logger.info(
-            "Connecting to Discord...",
-        )
+    try:
 
         await _bot.start(
             config.discord_token,
         )
-
-        _bot_ready = False
 
     except asyncio.CancelledError:
 
@@ -711,10 +695,8 @@ async def run_bot() -> None:
 
     except Exception:
 
-        _bot_ready = False
-
         logger.exception(
-            "Fatal bot error.",
+            "PAG Bot encountered an unexpected error.",
         )
 
         raise
@@ -723,26 +705,7 @@ async def run_bot() -> None:
 
         _bot_ready = False
 
-        if _bot is not None:
-
-            try:
-
-                await asyncio.wait_for(
-                    _bot.close(),
-                    timeout=SHUTDOWN_TIMEOUT,
-                )
-
-            except asyncio.TimeoutError:
-
-                logger.error(
-                    "Bot shutdown timed out.",
-                )
-
-            except Exception:
-
-                logger.exception(
-                    "Failed to close bot cleanly.",
-                )
+        await close_bot()
 
         logger.info(
             "PAG Bot stopped.",
@@ -750,66 +713,176 @@ async def run_bot() -> None:
 
 
 # ============================================================
-# MAIN ASYNC APPLICATION
+# BOT SUPERVISOR
 # ============================================================
 
-async def async_main() -> None:
+async def run_bot_supervisor() -> None:
     """
-    Ana async uygulama.
+    Botu izler.
+
+    Beklenmedik kapanma olursa:
+        10 saniye bekler.
+        Sonra tekrar başlatır.
+
+    Her başarısız denemede bekleme süresi
+    kontrollü şekilde artırılır.
+
+    Shutdown sinyali geldiyse yeniden başlatmaz.
+    """
+
+    logger = get_logger()
+
+    restart_delay = BOT_RESTART_DELAY
+
+    while not _shutdown_requested:
+
+        try:
+
+            logger.info(
+                "Starting PAG Bot...",
+            )
+
+            await run_bot_once()
+
+            if _shutdown_requested:
+
+                break
+
+            logger.warning(
+                "PAG Bot stopped unexpectedly.",
+            )
+
+        except asyncio.CancelledError:
+
+            logger.info(
+                "PAG Bot supervisor cancelled.",
+            )
+
+            raise
+
+        except Exception:
+
+            logger.exception(
+                "PAG Bot crashed unexpectedly.",
+            )
+
+        if _shutdown_requested:
+
+            break
+
+        logger.warning(
+            "Bot will restart in %.1f seconds.",
+            restart_delay,
+        )
+
+        try:
+
+            await asyncio.sleep(
+                restart_delay,
+            )
+
+        except asyncio.CancelledError:
+
+            raise
+
+        restart_delay = min(
+            restart_delay * 2,
+            MAX_BOT_RESTART_DELAY,
+        )
+
+    logger.info(
+        "PAG Bot supervisor stopped.",
+    )
+
+
+# ============================================================
+# BOT READY MONITOR
+# ============================================================
+
+async def ready_monitor() -> None:
+    """
+    Botun hazır durumunu takip eder.
+
+    Discord bağlantısı hazır olduğunda:
+        /health -> healthy
+    """
+
+    global _bot_ready
+
+    while not _shutdown_requested:
+
+        update_bot_ready_state()
+
+        try:
+
+            await asyncio.sleep(
+                1.0,
+            )
+
+        except asyncio.CancelledError:
+
+            break
+
+    _bot_ready = False
+
+
+# ============================================================
+# ASYNC APPLICATION
+# ============================================================
+
+async def run_application() -> None:
+    """
+    PAG Bot uygulamasının ana async lifecycle'ı.
     """
 
     global _shutdown_event
+    global _application_started_at
+
+    _application_started_at = (
+        time.monotonic()
+    )
 
     _shutdown_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
 
-    _register_signal_handlers(
+    register_signal_handlers(
         loop,
     )
 
-    # --------------------------------------------------------
-    # CONFIG
-    # --------------------------------------------------------
-
-    from config.config import load_config
-
     config = load_config()
 
-    # --------------------------------------------------------
-    # LOGGER
-    # --------------------------------------------------------
-
-    logger = get_logger()
-
-    logger.info(
-        "Starting PAG Bot application...",
+    logger = initialize_logger(
+        log_file=config.log_file_path,
     )
 
     logger.info(
-        "Python version: %s",
+        "========================================",
+    )
+
+    logger.info(
+        "Starting PAG Bot",
+    )
+
+    logger.info(
+        "Python: %s",
         sys.version.split()[0],
     )
 
     logger.info(
-        "HTTP health server will listen on port %s.",
+        "Port: %s",
         get_port(),
+    )
+
+    logger.info(
+        "========================================",
     )
 
     # --------------------------------------------------------
     # WEB SERVER
     # --------------------------------------------------------
 
-    web_thread = threading.Thread(
-        target=run_web_server,
-        args=(
-            get_port(),
-        ),
-        name="PAG-Health-Server",
-        daemon=True,
-    )
-
-    web_thread.start()
+    web_thread = start_web_server()
 
     logger.info(
         "Health server started.",
@@ -820,8 +893,13 @@ async def async_main() -> None:
     # --------------------------------------------------------
 
     bot_task = asyncio.create_task(
-        run_bot(),
-        name="PAG-Discord-Bot",
+        run_bot_supervisor(),
+        name="PAG-Bot-Supervisor",
+    )
+
+    ready_task = asyncio.create_task(
+        ready_monitor(),
+        name="PAG-Bot-Ready-Monitor",
     )
 
     shutdown_task = asyncio.create_task(
@@ -834,32 +912,11 @@ async def async_main() -> None:
         done, pending = await asyncio.wait(
             (
                 bot_task,
+                ready_task,
                 shutdown_task,
             ),
             return_when=asyncio.FIRST_COMPLETED,
         )
-
-        # ----------------------------------------------------
-        # BOT CRASHED
-        # ----------------------------------------------------
-
-        if bot_task in done:
-
-            exception = (
-                bot_task.exception()
-            )
-
-            if exception is not None:
-
-                logger.error(
-                    "Discord bot stopped unexpectedly.",
-                )
-
-                raise exception
-
-        # ----------------------------------------------------
-        # SHUTDOWN SIGNAL
-        # ----------------------------------------------------
 
         if shutdown_task in done:
 
@@ -867,43 +924,90 @@ async def async_main() -> None:
                 "Shutdown signal received.",
             )
 
-            if not bot_task.done():
+        if bot_task in done:
 
-                bot_task.cancel()
+            if not bot_task.cancelled():
 
-                try:
+                exception = (
+                    bot_task.exception()
+                )
 
-                    await asyncio.wait_for(
-                        bot_task,
-                        timeout=SHUTDOWN_TIMEOUT,
+                if exception is not None:
+
+                    logger.exception(
+                        "Bot supervisor stopped.",
+                        exc_info=exception,
                     )
 
-                except (
-                    asyncio.CancelledError,
-                    asyncio.TimeoutError,
-                ):
+        if ready_task in done:
 
-                    pass
+            if not ready_task.cancelled():
+
+                exception = (
+                    ready_task.exception()
+                )
+
+                if exception is not None:
+
+                    logger.exception(
+                        "Ready monitor stopped.",
+                        exc_info=exception,
+                    )
+
+    except asyncio.CancelledError:
+
+        logger.info(
+            "Application task cancelled.",
+        )
+
+        raise
+
+    except Exception:
+
+        logger.exception(
+            "Unexpected application error.",
+        )
 
     finally:
 
-        for task in (
+        global _shutdown_requested
+
+        _shutdown_requested = True
+
+        _shutdown_event.set()
+
+        logger.info(
+            "Beginning graceful shutdown...",
+        )
+
+        tasks = (
             bot_task,
+            ready_task,
             shutdown_task,
-        ):
+        )
+
+        for task in tasks:
 
             if not task.done():
 
                 task.cancel()
 
         await asyncio.gather(
-            bot_task,
-            shutdown_task,
+            *tasks,
             return_exceptions=True,
         )
 
+        await close_bot()
+
+        if web_thread.is_alive():
+
+            logger.info(
+                "Health server thread is still running "
+                "as daemon.",
+            )
+
         logger.info(
-            "Application shutdown completed.",
+            "PAG Bot shutdown completed.",
         )
 
 
@@ -913,15 +1017,13 @@ async def async_main() -> None:
 
 def main() -> None:
     """
-    Uygulama giriş noktası.
+    Uygulamanın ana giriş noktası.
     """
 
     try:
 
-        ensure_runtime_dependencies()
-
         asyncio.run(
-            async_main(),
+            run_application(),
         )
 
     except KeyboardInterrupt:
@@ -935,10 +1037,17 @@ def main() -> None:
             0,
         )
 
+    except SystemExit:
+
+        raise
+
     except Exception as error:
 
         print(
-            f"PAG Bot startup failed: {error}",
+            (
+                "PAG Bot encountered an unrecoverable "
+                f"startup error: {error}"
+            ),
             file=sys.stderr,
             flush=True,
         )
