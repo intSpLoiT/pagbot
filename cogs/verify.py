@@ -363,16 +363,24 @@ class Verify(commands.Cog):
     # COMMAND
     # =========================================================
 
-    @commands.command(
-        name="verify"
+    @app_commands.command(
+        name="verify",
+        description="PAG Roblox verification panelini gönderir.",
     )
-    @commands.guild_only()
+    @app_commands.guild_only()
     async def verify_command(
         self,
-        ctx: commands.Context,
+        interaction: discord.Interaction,
     ) -> None:
         """
         Verify panelini gönderir.
+
+        Bu komut bir slash command'dır:
+
+            /verify
+
+        Komut çalıştırıldığında
+        Roblox verification paneli gönderilir.
         """
 
         embed = PAGEmbeds.info(
@@ -382,7 +390,7 @@ class Verify(commands.Cog):
 
         embed.title = "🔗 PAG Verification"
 
-        await ctx.send(
+        await interaction.response.send_message(
             embed=embed,
             view=VerifyView(
                 self
