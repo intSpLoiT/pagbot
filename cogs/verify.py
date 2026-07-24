@@ -1,29 +1,50 @@
 from __future__ import annotations
 
-
 import logging
-
-
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Optional
-
+from typing import Any
 
 import discord
-
-
 from discord import app_commands
 from discord.ext import commands
-
 
 from services.roblox_service import (
     RobloxAPIError,
     RobloxNotFoundError,
     RobloxService,
 )
-
-
 from utils.embeds import PAGEmbeds
+
+
+# ============================================================
+# VERIFY CONFIGURATION
+# ============================================================
+
+
+class VerifyConfig:
+    """
+    Verify sistemi için merkezi ayarlar.
+
+    İleride burada:
+        - farklı kanal isimleri
+        - farklı rol isimleri
+        - farklı bildirim kullanıcıları
+        - farklı mesaj ayarları
+
+    kolayca değiştirilebilir.
+    """
+
+    VERIFIED_ROLE_NAME = "Verified"
+
+    VERIFIED_CHANNEL_NAME = "‽verified"
+
+    NOTIFICATION_USERNAME = "velgrath_"
+
+    MODAL_TITLE = "PAG Verification"
+
+    USERNAME_MIN_LENGTH = 3
+
+    USERNAME_MAX_LENGTH = 20
 
 
 # ============================================================
@@ -33,31 +54,20 @@ from utils.embeds import PAGEmbeds
 
 @dataclass(
     slots=True,
+    frozen=True,
 )
 class VerificationResult:
     """
-    Verify işleminin sonucunu temsil eder.
-
-    Gelecekte burada:
-
-        - Roblox ban durumu
-        - Roblox grup üyeliği
-        - Yaş doğrulaması
-        - Hesap yaşı
-        - Güven skoru
-
-    gibi bilgiler de tutulabilir.
+    Başarılı verification işleminin sonucu.
     """
 
-    roblox_id: int
+    discord_member: discord.Member
 
-    roblox_username: str
+    roblox_user: Any
 
-    roblox_display_name: str
+    avatar: Any
 
-    avatar_url: Optional[str] = None
-
-    verified_at: Optional[datetime] = None
+    verified_role: discord.Role
 
 
 # ============================================================
@@ -69,7 +79,12 @@ class VerifyModal(
     discord.ui.Modal,
 ):
     """
-    Roblox kullanıcı adı alma modalı.
+    Roblox username alma modalı.
+
+    Modal submit edildiğinde:
+        - Kullanıcıya ephemeral response gönderilir.
+        - Kanalda gereksiz mesaj oluşturulmaz.
+        - İşlem tamamlandığında DM gönderilir.
     """
 
     def __init__(
@@ -78,7 +93,7 @@ class VerifyModal(
     ) -> None:
 
         super().__init__(
-            title="PAG Verification",
+            title=VerifyConfig.MODAL_TITLE,
         )
 
         self.cog = cog
@@ -89,102 +104,135 @@ class VerifyModal(
                 "Roblox kullanıcı adını gir..."
             ),
             required=True,
-            min_length=3,
-            max_length=20,
+            min_length=(
+                VerifyConfig.USERNAME_MIN_LENGTH
+            ),
+            max_length=(
+                VerifyConfig.USERNAME_MAX_LENGTH
+            ),
         )
 
         self.add_item(
             self.username,
         )
 
-    # ========================================================
-    # MODAL SUBMIT
-    # ========================================================
-
     async def on_submit(
         self,
         interaction: discord.Interaction,
     ) -> None:
+        """
+        Modal gönderildiğinde çalışır.
+
+        İlk response ephemeral defer edilir.
+
+        Böylece:
+            - Kanalda mesaj oluşmaz.
+            - Başarı/başarısızlık yalnızca kullanıcıya görünür.
+        """
 
         await interaction.response.defer(
             ephemeral=True,
         )
 
         username = (
-            self.username.value
-            .strip()
+            self.username.value.strip()
         )
+
+        if not username:
+
+            await self.cog.respond_ephemeral_error(
+                interaction,
+                "Roblox kullanıcı adı boş bırakılamaz.",
+            )
+
+            return
 
         try:
 
             result = (
-                await self.cog.verify_user(
+                await self.cog.process_verification(
                     interaction=interaction,
                     username=username,
                 )
             )
 
-            await self.cog.send_success_response(
-                interaction=interaction,
-                result=result,
-            )
-
         except RobloxNotFoundError:
 
-            await interaction.edit_original_response(
-                embed=PAGEmbeds.error(
-                    "Roblox hesabı bulunamadı.",
-                ),
+            await self.cog.handle_verification_failure(
+                interaction,
+                "Bu Roblox hesabı bulunamadı.",
             )
+
+            return
 
         except RobloxAPIError:
 
             self.cog.logger.exception(
+                "Roblox API error during verification.",
+            )
+
+            await self.cog.handle_verification_failure(
+                interaction,
                 (
-                    "Roblox API error during "
-                    "verification."
+                    "Roblox API şu anda kullanılamıyor. "
+                    "Lütfen daha sonra tekrar deneyin."
                 ),
             )
 
-            await interaction.edit_original_response(
-                embed=PAGEmbeds.error(
-                    (
-                        "Roblox API şu anda "
-                        "kullanılamıyor. "
-                        "Lütfen daha sonra tekrar "
-                        "deneyin."
-                    ),
+            return
+
+        except discord.Forbidden:
+
+            self.cog.logger.exception(
+                "Discord permission error during verification.",
+            )
+
+            await self.cog.handle_verification_failure(
+                interaction,
+                (
+                    "Botun gerekli Discord izinleri yok. "
+                    "Lütfen yöneticilere bildir."
                 ),
             )
 
-        except PermissionError:
+            return
 
-            await interaction.edit_original_response(
-                embed=PAGEmbeds.error(
-                    (
-                        "Bu işlemi gerçekleştirmek "
-                        "için gerekli izinler yok."
-                    ),
+        except discord.HTTPException:
+
+            self.cog.logger.exception(
+                "Discord HTTP error during verification.",
+            )
+
+            await self.cog.handle_verification_failure(
+                interaction,
+                (
+                    "Discord ile iletişim kurulurken "
+                    "bir hata oluştu."
                 ),
             )
+
+            return
 
         except Exception:
 
             self.cog.logger.exception(
+                "Unexpected verification error.",
+            )
+
+            await self.cog.handle_verification_failure(
+                interaction,
                 (
-                    "Unexpected verification "
-                    "error."
+                    "Verify işlemi sırasında beklenmeyen "
+                    "bir hata oluştu."
                 ),
             )
 
-            await interaction.edit_original_response(
-                embed=PAGEmbeds.error(
-                    (
-                        "Verify işlemi sırasında "
-                        "beklenmeyen bir hata oluştu."
-                    ),
-                ),
-            )
+            return
+
+        await self.cog.handle_verification_success(
+            interaction,
+            result,
+        )
 
 
 # ============================================================
@@ -196,7 +244,7 @@ class VerifyView(
     discord.ui.View,
 ):
     """
-    Persistent PAG Verify paneli.
+    Persistent verify paneli.
     """
 
     def __init__(
@@ -210,10 +258,6 @@ class VerifyView(
 
         self.cog = cog
 
-    # ========================================================
-    # VERIFY BUTTON
-    # ========================================================
-
     @discord.ui.button(
         label="Verify",
         emoji="🔗",
@@ -225,12 +269,20 @@ class VerifyView(
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ) -> None:
+        """
+        Verify butonuna basıldığında modal açılır.
+
+        Burada mesaj gönderilmez.
+
+        Discord'un modal interaction response'u:
+            response.send_modal(...)
+        """
 
         if interaction.guild is None:
 
             await interaction.response.send_message(
                 (
-                    "Bu buton sadece sunucuda "
+                    "Bu buton yalnızca sunucuda "
                     "kullanılabilir."
                 ),
                 ephemeral=True,
@@ -247,7 +299,7 @@ class VerifyView(
 
             await interaction.response.send_message(
                 (
-                    "Üye bilgisi alınamadı."
+                    "Sunucu üye bilgilerin alınamadı."
                 ),
                 ephemeral=True,
             )
@@ -255,8 +307,7 @@ class VerifyView(
             return
 
         if (
-            self.cog
-            .discord_service
+            self.cog.discord_service
             .is_blocked_from_verification(
                 member,
             )
@@ -264,10 +315,7 @@ class VerifyView(
 
             await interaction.response.send_message(
                 embed=PAGEmbeds.error(
-                    (
-                        "Ally üyeleri verify "
-                        "olamaz."
-                    ),
+                    "Ally üyeleri verify olamaz.",
                 ),
                 ephemeral=True,
             )
@@ -292,47 +340,35 @@ class Verify(
     """
     PAG Roblox Verification sistemi.
 
-    Bu Cog şu anda:
-
+    Desteklenen:
         /verify
         !verify
-        Verify Button
-        Roblox Username Modal
+
+    İşlem akışı:
+        Roblox username
+            ↓
         Roblox API
+            ↓
+        Verification kontrolleri
+            ↓
         Database
-        Verified Role
-
-    sistemlerini yönetir.
-
-    Gelecekte:
-
-        /unlink
-        /roblox
-        /roblox-profile
-        /change-roblox
-
-    gibi komutlar buraya eklenebilir.
+            ↓
+        Verified role
+            ↓
+        User DM
+            ↓
+        ‽verified log
+            ↓
+        velgrath_ notification
     """
-
-    # ========================================================
-    # CONSTANTS
-    # ========================================================
-
-    VERIFIED_ROLE_NAME = (
-        "Verified"
-    )
-
-    # ========================================================
-    # INIT
-    # ========================================================
 
     def __init__(
         self,
         bot: commands.Bot,
         *,
         roblox_service: RobloxService,
-        discord_service,
-        database,
+        discord_service: Any,
+        database: Any,
         logger: logging.Logger,
     ) -> None:
 
@@ -363,6 +399,9 @@ class Verify(
     async def cog_load(
         self,
     ) -> None:
+        """
+        Persistent verify view'i kaydeder.
+        """
 
         if self._view_added:
 
@@ -381,30 +420,196 @@ class Verify(
         )
 
     # ========================================================
-    # VERIFICATION
+    # SLASH COMMAND
     # ========================================================
 
-    async def verify_user(
+    @app_commands.command(
+        name="verify",
+        description=(
+            "Link your Roblox account "
+            "to your PAG profile."
+        ),
+    )
+    @app_commands.guild_only()
+    async def verify_command(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        """
+        /verify
+
+        Verify panelini gönderir.
+
+        Bu command:
+            - Guild içinde çalışır.
+            - Guild sync ile görünür.
+            - Paneli kanal içine gönderir.
+        """
+
+        if interaction.guild is None:
+
+            await interaction.response.send_message(
+                (
+                    "Bu komut yalnızca sunucuda "
+                    "kullanılabilir."
+                ),
+                ephemeral=True,
+            )
+
+            return
+
+        embed = PAGEmbeds.info(
+            (
+                "Roblox hesabını Discord hesabına "
+                "bağlamak için aşağıdaki butona bas."
+            ),
+        )
+
+        embed.title = (
+            "🔗 PAG Verification"
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=VerifyView(
+                self,
+            ),
+        )
+
+    # ========================================================
+    # PREFIX COMMAND
+    # ========================================================
+
+    @commands.command(
+        name="verify",
+    )
+    @commands.guild_only()
+    async def verify_prefix_command(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        """
+        !verify
+
+        Slash command ile aynı paneli gönderir.
+        """
+
+        embed = PAGEmbeds.info(
+            (
+                "Roblox hesabını Discord hesabına "
+                "bağlamak için aşağıdaki butona bas."
+            ),
+        )
+
+        embed.title = (
+            "🔗 PAG Verification"
+        )
+
+        await ctx.send(
+            embed=embed,
+            view=VerifyView(
+                self,
+            ),
+        )
+
+    # ========================================================
+    # MAIN VERIFICATION PROCESS
+    # ========================================================
+
+    async def process_verification(
         self,
         interaction: discord.Interaction,
         username: str,
     ) -> VerificationResult:
         """
-        Roblox hesabını doğrular.
+        Ana verification akışı.
 
-        Bu metod yalnızca verify işlemini yapar.
-        Discord mesajı göndermeyi ayrı metotlara
-        bırakır.
-
-        Böylece gelecekte:
-
-            - API
-            - Web panel
-            - Admin command
-            - Automatic verification
-
-        aynı sistemi kullanabilir.
+        Bu fonksiyon mümkün olduğunca
+        küçük kontrol fonksiyonlarına bölünmüştür.
         """
+
+        member = (
+            await self.require_guild_member(
+                interaction,
+            )
+        )
+
+        await self.validate_member(
+            member,
+        )
+
+        username = (
+            self.normalize_username(
+                username,
+            )
+        )
+
+        roblox_user = (
+            await self.fetch_roblox_user(
+                username,
+            )
+        )
+
+        await self.validate_roblox_user(
+            roblox_user,
+        )
+
+        await self.check_existing_discord_verification(
+            member.id,
+        )
+
+        await self.check_roblox_account_ownership(
+            roblox_user.id,
+            member.id,
+        )
+
+        avatar = (
+            await self.fetch_avatar_safely(
+                roblox_user.id,
+            )
+        )
+
+        verified_role = (
+            await self.get_verified_role(
+                interaction.guild,
+            )
+        )
+
+        await self.save_verification(
+            member=member,
+            roblox_user=roblox_user,
+        )
+
+        await self.assign_verified_role(
+            member=member,
+            role=verified_role,
+        )
+
+        return VerificationResult(
+            discord_member=member,
+            roblox_user=roblox_user,
+            avatar=avatar,
+            verified_role=verified_role,
+        )
+
+    # ========================================================
+    # MEMBER VALIDATION
+    # ========================================================
+
+    async def require_guild_member(
+        self,
+        interaction: discord.Interaction,
+    ) -> discord.Member:
+        """
+        Interaction kullanıcısının guild member
+        olduğundan emin olur.
+        """
+
+        if interaction.guild is None:
+
+            raise RuntimeError(
+                "Verification requires a guild.",
+            )
 
         member = (
             interaction.user
@@ -416,15 +621,19 @@ class Verify(
         ):
 
             raise RuntimeError(
-                (
-                    "Interaction user is "
-                    "not a guild member."
-                ),
+                "Interaction user is not a guild member.",
             )
 
-        # ====================================================
-        # ALLY CHECK
-        # ====================================================
+        return member
+
+    async def validate_member(
+        self,
+        member: discord.Member,
+    ) -> None:
+        """
+        Üyenin verification yapmasına izin
+        verilip verilmediğini kontrol eder.
+        """
 
         if (
             self.discord_service
@@ -434,57 +643,287 @@ class Verify(
         ):
 
             raise PermissionError(
-                (
-                    "Member is blocked "
-                    "from verification."
-                ),
+                "Member is blocked from verification.",
             )
 
-        # ====================================================
-        # ROBLOX USER
-        # ====================================================
+    # ========================================================
+    # USERNAME
+    # ========================================================
 
-        user = (
+    @staticmethod
+    def normalize_username(
+        username: str,
+    ) -> str:
+        """
+        Username'i normalize eder.
+        """
+
+        username = (
+            username.strip()
+        )
+
+        if not username:
+
+            raise ValueError(
+                "Username cannot be empty.",
+            )
+
+        return username
+
+    # ========================================================
+    # ROBLOX
+    # ========================================================
+
+    async def fetch_roblox_user(
+        self,
+        username: str,
+    ) -> Any:
+        """
+        Roblox kullanıcısını güvenli şekilde bulur.
+        """
+
+        return (
             await self.roblox_service
             .get_user_by_username(
                 username,
             )
         )
 
-        # ====================================================
-        # BANNED USER
-        # ====================================================
+    async def validate_roblox_user(
+        self,
+        roblox_user: Any,
+    ) -> None:
+        """
+        Roblox hesabı için temel kontroller.
+        """
 
-        if user.is_banned:
+        if roblox_user is None:
+
+            raise RobloxNotFoundError(
+                "Roblox user is empty.",
+            )
+
+        if roblox_user.id <= 0:
+
+            raise RobloxAPIError(
+                "Invalid Roblox user ID.",
+            )
+
+        if roblox_user.is_banned:
 
             raise PermissionError(
+                "Roblox account is banned.",
+            )
+
+    async def fetch_avatar_safely(
+        self,
+        roblox_id: int,
+    ) -> Any | None:
+        """
+        Avatar alınamazsa verification işlemini
+        tamamen bozmaz.
+
+        Avatar yalnızca görsel bilgidir.
+        """
+
+        try:
+
+            return (
+                await self.roblox_service
+                .get_avatar(
+                    roblox_id,
+                )
+            )
+
+        except (
+            RobloxNotFoundError,
+            RobloxAPIError,
+        ):
+
+            self.logger.warning(
                 (
-                    "Roblox user is banned."
+                    "Avatar could not be fetched "
+                    "for Roblox user %s."
+                ),
+                roblox_id,
+            )
+
+            return None
+
+    # ========================================================
+    # DATABASE CHECKS
+    # ========================================================
+
+    async def check_existing_discord_verification(
+        self,
+        discord_id: int,
+    ) -> None:
+        """
+        Discord hesabının mevcut verify durumunu
+        kontrol eder.
+
+        Aynı Discord hesabı yeniden verify olabilir.
+        Bu durumda kayıt güncellenecektir.
+        """
+
+        row = await self.database.fetchone(
+            """
+            SELECT
+                discord_id,
+                roblox_id,
+                roblox_username
+            FROM verifications
+            WHERE discord_id = ?
+            LIMIT 1
+            """,
+            (
+                discord_id,
+            ),
+        )
+
+        if row is None:
+
+            return
+
+        self.logger.info(
+            (
+                "Existing verification found "
+                "for Discord user %s. "
+                "Existing record will be replaced."
+            ),
+            discord_id,
+        )
+
+    async def check_roblox_account_ownership(
+        self,
+        roblox_id: int,
+        discord_id: int,
+    ) -> None:
+        """
+        Aynı Roblox hesabının başka bir Discord
+        hesabına bağlı olup olmadığını kontrol eder.
+
+        Bu önemli bir anti-abuse kontrolüdür.
+        """
+
+        row = await self.database.fetchone(
+            """
+            SELECT
+                discord_id,
+                roblox_id,
+                roblox_username
+            FROM verifications
+            WHERE roblox_id = ?
+            LIMIT 1
+            """,
+            (
+                roblox_id,
+            ),
+        )
+
+        if row is None:
+
+            return
+
+        existing_discord_id = (
+            int(
+                row["discord_id"],
+            )
+        )
+
+        if existing_discord_id == discord_id:
+
+            return
+
+        raise PermissionError(
+            (
+                "This Roblox account is already "
+                "linked to another Discord account."
+            ),
+        )
+
+    # ========================================================
+    # ROLE
+    # ========================================================
+
+    async def get_verified_role(
+        self,
+        guild: discord.Guild | None,
+    ) -> discord.Role:
+        """
+        Verified rolünü bulur.
+        """
+
+        if guild is None:
+
+            raise RuntimeError(
+                "Guild is required.",
+            )
+
+        role = (
+            self.discord_service
+            .find_role(
+                guild,
+                VerifyConfig.VERIFIED_ROLE_NAME,
+            )
+        )
+
+        if role is None:
+
+            raise RuntimeError(
+                (
+                    "Verified role was not found: "
+                    f"{VerifyConfig.VERIFIED_ROLE_NAME}"
                 ),
             )
 
-        # ====================================================
-        # AVATAR
-        # ====================================================
+        return role
 
-        avatar = (
-            await self.roblox_service
-            .get_avatar(
-                user.id,
+    async def assign_verified_role(
+        self,
+        member: discord.Member,
+        role: discord.Role,
+    ) -> None:
+        """
+        Verified rolünü güvenli şekilde verir.
+        """
+
+        if role in member.roles:
+
+            self.logger.info(
+                (
+                    "Member %s already has "
+                    "Verified role."
+                ),
+                member.id,
             )
+
+            return
+
+        await self.discord_service.add_role(
+            member,
+            role,
+            reason=(
+                "PAG Roblox verification"
+            ),
         )
 
-        # ====================================================
-        # TIMESTAMP
-        # ====================================================
+     # ========================================================
+    # DATABASE SAVE
+    # ========================================================
 
-        verified_at = (
-            discord.utils.utcnow()
-        )
+    async def save_verification(
+        self,
+        member: discord.Member,
+        roblox_user: Any,
+    ) -> None:
+        """
+        Verification kaydını database'e yazar.
 
-        # ====================================================
-        # DATABASE
-        # ====================================================
+        INSERT OR REPLACE:
+            - Aynı Discord hesabının eski kaydını günceller.
+            - Yeni hesabı ekler.
+        """
 
         await self.database.execute(
             """
@@ -498,70 +937,36 @@ class Verify(
             """,
             (
                 member.id,
-                user.id,
-                user.name,
-                verified_at.isoformat(),
+                roblox_user.id,
+                roblox_user.name,
+                discord.utils.utcnow().isoformat(),
             ),
-        )
-
-        # ====================================================
-        # VERIFIED ROLE
-        # ====================================================
-
-        verified_role = (
-            self.discord_service
-            .find_role(
-                interaction.guild,
-                self.VERIFIED_ROLE_NAME,
-            )
-        )
-
-        if verified_role is None:
-
-            raise RuntimeError(
-                (
-                    "Verified role was not found."
-                ),
-            )
-
-        await self.discord_service.add_role(
-            member,
-            verified_role,
-            reason=(
-                "PAG Roblox verification"
-            ),
-        )
-
-        # ====================================================
-        # RESULT
-        # ====================================================
-
-        return VerificationResult(
-            roblox_id=user.id,
-            roblox_username=user.name,
-            roblox_display_name=(
-                user.display_name
-            ),
-            avatar_url=(
-                avatar.image_url
-            ),
-            verified_at=verified_at,
         )
 
     # ========================================================
-    # SUCCESS RESPONSE
+    # SUCCESS HANDLER
     # ========================================================
 
-    async def send_success_response(
+    async def handle_verification_success(
         self,
         interaction: discord.Interaction,
         result: VerificationResult,
     ) -> None:
+        """
+        Başarılı verification işlemini yönetir.
 
-        embed = (
-            PAGEmbeds.success(
-                "Verify başarılı!",
-            )
+        1. Kullanıcıya ephemeral başarı mesajı
+        2. Kullanıcıya DM
+        3. ‽verified kanalına log
+        4. velgrath_ kullanıcısına bildirim
+        """
+
+        roblox_user = (
+            result.roblox_user
+        )
+
+        embed = PAGEmbeds.success(
+            "Verify başarılı!",
         )
 
         embed.title = (
@@ -570,130 +975,443 @@ class Verify(
 
         embed.description = (
             f"**Roblox hesabı:** "
-            f"`{result.roblox_username}`\n"
+            f"`{roblox_user.name}`\n"
             f"**Display Name:** "
-            f"`{result.roblox_display_name}`\n"
+            f"`{roblox_user.display_name}`\n"
             f"**Roblox ID:** "
-            f"`{result.roblox_id}`"
+            f"`{roblox_user.id}`"
         )
 
-        if result.verified_at:
-
-            embed.description += (
-                "\n"
-                f"**Verified:** "
-                f"<t:{int(result.verified_at.timestamp())}:R>"
-            )
-
-        if result.avatar_url:
+        if result.avatar is not None:
 
             embed.set_thumbnail(
-                url=result.avatar_url,
+                url=result.avatar.image_url,
             )
 
-        await interaction.edit_original_response(
-            embed=embed,
+        # ----------------------------------------------------
+        # USER EPHEMERAL RESPONSE
+        # ----------------------------------------------------
+
+        await self.respond_ephemeral_success(
+            interaction,
+            embed,
+        )
+
+        # ----------------------------------------------------
+        # USER DM
+        # ----------------------------------------------------
+
+        await self.send_user_dm(
+            result,
+        )
+
+        # ----------------------------------------------------
+        # VERIFIED CHANNEL LOG
+        # ----------------------------------------------------
+
+        await self.send_verification_log(
+            result,
+        )
+
+        # ----------------------------------------------------
+        # OWNER NOTIFICATION
+        # ----------------------------------------------------
+
+        await self.notify_verification_owner(
+            result,
+        )
+
+        self.logger.info(
+            (
+                "Verification completed: "
+                "Discord=%s Roblox=%s"
+            ),
+            result.discord_member.id,
+            result.roblox_user.id,
         )
 
     # ========================================================
-    # VERIFY PANEL
+    # FAILURE HANDLER
     # ========================================================
 
-    async def send_verify_panel(
+    async def handle_verification_failure(
         self,
-        target: discord.abc.Messageable,
+        interaction: discord.Interaction,
+        message: str,
     ) -> None:
+        """
+        Tüm başarısız verification işlemlerinde
+        ortak hata akışı.
+        """
 
-        embed = (
-            PAGEmbeds.info(
+        embed = PAGEmbeds.error(
+            message,
+        )
+
+        try:
+
+            await self.respond_ephemeral_error(
+                interaction,
+                message,
+            )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
                 (
-                    "Roblox hesabını Discord "
-                    "hesabına bağlamak için "
-                    "aşağıdaki butona bas."
+                    "Failed to send ephemeral "
+                    "verification error."
+                ),
+            )
+
+        # Hata logu ileride buraya
+        # database audit sistemi eklenerek
+        # genişletilebilir.
+
+    # ========================================================
+    # EPHEMERAL SUCCESS
+    # ========================================================
+
+    async def respond_ephemeral_success(
+        self,
+        interaction: discord.Interaction,
+        embed: discord.Embed,
+    ) -> None:
+        """
+        Başarı mesajını yalnızca işlemi yapan
+        kullanıcıya gösterir.
+        """
+
+        if interaction.response.is_done():
+
+            await interaction.edit_original_response(
+                embed=embed,
+            )
+
+            return
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    # ========================================================
+    # EPHEMERAL ERROR
+    # ========================================================
+
+    async def respond_ephemeral_error(
+        self,
+        interaction: discord.Interaction,
+        message: str,
+    ) -> None:
+        """
+        Hata mesajını yalnızca kullanıcıya gösterir.
+        """
+
+        embed = PAGEmbeds.error(
+            message,
+        )
+
+        if interaction.response.is_done():
+
+            await interaction.edit_original_response(
+                embed=embed,
+            )
+
+            return
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True,
+        )
+
+    # ========================================================
+    # USER DM
+    # ========================================================
+
+    async def send_user_dm(
+        self,
+        result: VerificationResult,
+    ) -> None:
+        """
+        Verify yapan kullanıcıya DM gönderir.
+
+        DM kapalıysa verification başarısız sayılmaz.
+        """
+
+        member = (
+            result.discord_member
+        )
+
+        roblox_user = (
+            result.roblox_user
+        )
+
+        embed = PAGEmbeds.success(
+            (
+                "Roblox hesabın başarıyla "
+                "Discord hesabına bağlandı."
+            ),
+        )
+
+        embed.title = (
+            "🔗 PAG Verification Complete"
+        )
+
+        embed.description = (
+            f"**Roblox hesabı:** "
+            f"`{roblox_user.name}`\n"
+            f"**Display Name:** "
+            f"`{roblox_user.display_name}`\n"
+            f"**Roblox ID:** "
+            f"`{roblox_user.id}`"
+        )
+
+        try:
+
+            await member.send(
+                embed=embed,
+            )
+
+        except discord.Forbidden:
+
+            self.logger.warning(
+                (
+                    "Could not DM verified user %s. "
+                    "DMs may be disabled."
+                ),
+                member.id,
+            )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                (
+                    "Failed to send verification DM "
+                    "to user %s."
+                ),
+                member.id,
+            )
+
+    # ========================================================
+    # VERIFIED CHANNEL
+    # ========================================================
+
+    async def send_verification_log(
+        self,
+        result: VerificationResult,
+    ) -> None:
+        """
+        ‽verified kanalına verification logu gönderir.
+        """
+
+        guild = (
+            result.discord_member.guild
+        )
+
+        channel = (
+            discord.utils.get(
+                guild.text_channels,
+                name=(
+                    VerifyConfig
+                    .VERIFIED_CHANNEL_NAME
                 ),
             )
         )
 
-        embed.title = (
-            "🔗 PAG Verification"
+        if channel is None:
+
+            self.logger.warning(
+                (
+                    "Verification channel not found: %s"
+                ),
+                VerifyConfig.VERIFIED_CHANNEL_NAME,
+            )
+
+            return
+
+        roblox_user = (
+            result.roblox_user
         )
 
-        embed.add_field(
-            name="📌 Nasıl çalışır?",
-            value=(
-                "1. Verify butonuna bas.\n"
-                "2. Roblox kullanıcı adını gir.\n"
-                "3. Hesabın doğrulansın.\n"
-                "4. Verified rolünü al."
+        embed = discord.Embed(
+            title=(
+                "✅ New Verification"
             ),
-            inline=False,
+            description=(
+                f"**Discord:** "
+                f"{result.discord_member.mention}\n"
+                f"**Roblox:** "
+                f"`{roblox_user.name}`\n"
+                f"**Display Name:** "
+                f"`{roblox_user.display_name}`\n"
+                f"**Roblox ID:** "
+                f"`{roblox_user.id}`"
+            ),
+            timestamp=(
+                discord.utils.utcnow()
+            ),
         )
 
-        embed.add_field(
-            name="🛡️ Güvenlik",
-            value=(
-                "Yalnızca Roblox kullanıcı "
-                "adını girmen yeterlidir."
-            ),
-            inline=False,
-        )
+        if result.avatar is not None:
 
-        await target.send(
-            embed=embed,
-            view=VerifyView(
-                self,
-            ),
-        )
+            embed.set_thumbnail(
+                url=result.avatar.image_url,
+            )
+
+        try:
+
+            await channel.send(
+                embed=embed,
+            )
+
+        except discord.Forbidden:
+
+            self.logger.exception(
+                (
+                    "Missing permission to send "
+                    "verification log."
+                ),
+            )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                (
+                    "Failed to send verification "
+                    "channel log."
+                ),
+            )
 
     # ========================================================
-    # SLASH COMMAND
+    # OWNER NOTIFICATION
     # ========================================================
 
-    @app_commands.command(
-        name="verify",
-        description=(
-            "Open the PAG Roblox "
-            "verification panel."
-        ),
-    )
-    @app_commands.guild_only()
-    async def verify_slash(
+    async def notify_verification_owner(
         self,
-        interaction: discord.Interaction,
+        result: VerificationResult,
     ) -> None:
+        """
+        velgrath_ adlı kullanıcıya DM gönderir.
 
-        self.logger.info(
-            "Verify panel opened by %s (%s).",
-            interaction.user,
-            interaction.user.id,
+        Kullanıcı ID'si sabitlenmediği için:
+            - Önce guild cache'indeki üyeler aranır.
+            - Username veya global name kontrol edilir.
+        """
+
+        owner = (
+            self.find_notification_user(
+                result.discord_member.guild,
+            )
         )
 
-        await self.send_verify_panel(
-            interaction,
+        if owner is None:
+
+            self.logger.warning(
+                (
+                    "Verification notification user "
+                    "not found: %s"
+                ),
+                VerifyConfig.NOTIFICATION_USERNAME,
+            )
+
+            return
+
+        roblox_user = (
+            result.roblox_user
         )
+
+        embed = discord.Embed(
+            title=(
+                "🔔 PAG Verification Notification"
+            ),
+            description=(
+                f"**Discord User:** "
+                f"{result.discord_member} "
+                f"({result.discord_member.id})\n"
+                f"**Roblox Username:** "
+                f"`{roblox_user.name}`\n"
+                f"**Roblox ID:** "
+                f"`{roblox_user.id}`"
+            ),
+            timestamp=(
+                discord.utils.utcnow()
+            ),
+        )
+
+        if result.avatar is not None:
+
+            embed.set_thumbnail(
+                url=result.avatar.image_url,
+            )
+
+        try:
+
+            await owner.send(
+                embed=embed,
+            )
+
+        except discord.Forbidden:
+
+            self.logger.warning(
+                (
+                    "Could not DM notification "
+                    "user %s."
+                ),
+                owner.id,
+            )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                (
+                    "Failed to send verification "
+                    "notification."
+                ),
+            )
 
     # ========================================================
-    # PREFIX COMMAND
+    # FIND NOTIFICATION USER
     # ========================================================
 
-    @commands.command(
-        name="verify",
-    )
-    @commands.guild_only()
-    async def verify_prefix(
-        self,
-        ctx: commands.Context,
-    ) -> None:
+    @staticmethod
+    def find_notification_user(
+        guild: discord.Guild,
+    ) -> discord.Member | None:
+        """
+        velgrath_ kullanıcısını guild cache'inde arar.
 
-        self.logger.info(
-            "Prefix verify panel opened by %s (%s).",
-            ctx.author,
-            ctx.author.id,
+        Öncelik:
+            1. username
+            2. global_name
+            3. display_name
+        """
+
+        target = (
+            VerifyConfig
+            .NOTIFICATION_USERNAME
+            .casefold()
         )
 
-        await self.send_verify_panel(
-            ctx,
-        )
+        for member in guild.members:
+
+            candidates = (
+                member.name,
+                member.global_name,
+                member.display_name,
+            )
+
+            for candidate in candidates:
+
+                if (
+                    candidate is not None
+                    and candidate.casefold()
+                    == target
+                ):
+
+                    return member
+
+        return None
 
 
 # ============================================================
@@ -704,6 +1422,9 @@ class Verify(
 async def setup(
     bot: commands.Bot,
 ) -> None:
+    """
+    Verify Cog setup.
+    """
 
     await bot.add_cog(
         Verify(
