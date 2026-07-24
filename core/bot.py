@@ -29,6 +29,7 @@ class PAGBot(commands.Bot):
     - EventService yaşam döngüsü
     - Cog yükleme ve kaldırma
     - Guild kontrolü
+    - Prefix command guild kontrolü
     - Slash command guild sync
     - Discord presence yönetimi
     - Kontrollü kapanış
@@ -119,6 +120,14 @@ class PAGBot(commands.Bot):
 
         self._started_at = time.monotonic()
 
+        # ====================================================
+        # GLOBAL PREFIX CHECK
+        # ====================================================
+
+        self.add_check(
+            self._guild_prefix_check,
+        )
+
     # ========================================================
     # SETUP HOOK
     # ========================================================
@@ -194,7 +203,7 @@ class PAGBot(commands.Bot):
 
         # ====================================================
         # COGS
-        # ========================================================
+        # ====================================================
 
         await self.cog_loader.load_all()
 
@@ -239,6 +248,58 @@ class PAGBot(commands.Bot):
         )
 
     # ========================================================
+    # PREFIX GUILD CHECK
+    # ========================================================
+
+    async def _guild_prefix_check(
+        self,
+        context: commands.Context,
+    ) -> bool:
+        """
+        Tüm prefix komutlarının yalnızca
+        PAG guild'inde çalışmasını sağlar.
+
+        Örnek:
+
+            !help
+            !verify
+            !profile
+
+        Bu komutlar yalnızca Config içinde
+        belirtilen DISCORD_GUILD_ID sunucusunda
+        çalışabilir.
+        """
+
+        # DM üzerinden çalıştırılan komutları engelle
+
+        if context.guild is None:
+
+            return False
+
+        allowed_guild_id = (
+            self.config.discord_guild_id
+        )
+
+        # Doğru guild
+
+        if context.guild.id == allowed_guild_id:
+
+            return True
+
+        # Yetkisiz guild
+
+        self.logger.warning(
+            (
+                "Prefix command blocked outside "
+                "allowed guild: %s (%s)."
+            ),
+            context.guild.name,
+            context.guild.id,
+        )
+
+        return False
+
+    # ========================================================
     # SLASH COMMAND SYNC
     # ========================================================
 
@@ -248,16 +309,18 @@ class PAGBot(commands.Bot):
         """
         Slash command'ları PAG guild'ine senkronize eder.
 
-        Guild sync kullanıldığı için komutlar
+        Guild sync kullanıldığı için slash komutlar
         yalnızca yapılandırılmış sunucuda görünür.
 
-        Bu yöntem:
+        Discord'daki mevcut guild command listesi
+        gönderilen yeni listeyle güncellenir.
 
-            - Komut listesini Discord'a gönderir.
-            - Eski guild komutlarını günceller.
-            - Yeni komutları ekler.
-            - Silinen komutları temizler.
-            - Global command cache sorunlarını önler.
+        Böylece:
+
+            - Yeni komutlar eklenir.
+            - Silinen komutlar temizlenir.
+            - Eski komutlar güncellenir.
+            - Global command cache beklenmez.
         """
 
         if self._commands_synced:
@@ -527,6 +590,7 @@ class PAGBot(commands.Bot):
         uptime = self._get_uptime()
 
         activities = (
+
             discord.Activity(
                 type=discord.ActivityType.watching,
                 name="/help",
@@ -559,10 +623,12 @@ class PAGBot(commands.Bot):
         )
 
         current_index = (
+
             int(
                 time.monotonic()
                 // self.PRESENCE_INTERVAL
             )
+
             % len(activities)
         )
 
@@ -713,6 +779,13 @@ class PAGBot(commands.Bot):
 
             return
 
+        if isinstance(
+            exception,
+            commands.CheckFailure,
+        ):
+
+            return
+
         self.logger.error(
             "Command error: %s",
             exception,
@@ -829,7 +902,6 @@ class PAGBot(commands.Bot):
     # SERVICE CLOSE HELPER
     # ========================================================
 
-  
     async def _close_service(
         self,
         service: Any,
