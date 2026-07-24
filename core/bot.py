@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from config.config import Config
 from core.database import Database
@@ -22,13 +23,25 @@ class PAGBot(commands.Bot):
 
     - Discord bağlantısı
     - Database yaşam döngüsü
+    - Database migration sistemi
     - RobloxService yaşam döngüsü
     - DiscordService yaşam döngüsü
-    - EventService başlatılması
-    - Cog yükleme
+    - EventService yaşam döngüsü
+    - Cog yükleme ve kaldırma
     - Guild kontrolü
+    - Discord presence yönetimi
     - Kontrollü kapanış
     """
+
+    # ========================================================
+    # PRESENCE SETTINGS
+    # ========================================================
+
+    PRESENCE_INTERVAL: int = 60
+
+    # ========================================================
+    # INIT
+    # ========================================================
 
     def __init__(
         self,
@@ -78,6 +91,9 @@ class PAGBot(commands.Bot):
 
         self._started = False
         self._closed = False
+        self._ready_logged = False
+        self._presence_started = False
+        self._started_at = time.monotonic()
 
     # ========================================================
     # SETUP HOOK
@@ -87,16 +103,19 @@ class PAGBot(commands.Bot):
         """
         Discord bağlantısı kurulmadan önce çalışır.
 
-        Ağır işlemleri on_ready içine koymuyoruz.
+        Bu method Discord tarafından normalde
+        bağlantı başlangıcında bir kez çağrılır.
 
-        Böylece:
-            - Cog'lar birden fazla kez yüklenmez.
-            - Database başlangıcı kontrollü olur.
-            - Servisler hazır olmadan komutlar çalışmaz.
-            - Reconnect sırasında initialization tekrarlanmaz.
+        Ağır initialization işlemleri burada
+        kontrollü şekilde yapılır.
         """
 
         if self._started:
+
+            self.logger.debug(
+                "PAG Bot initialization already completed.",
+            )
+
             return
 
         self.logger.info(
@@ -160,9 +179,6 @@ class PAGBot(commands.Bot):
     async def _run_migrations(self) -> None:
         """
         Database migration sistemini çalıştırır.
-
-        MigrationManager'ın mevcut yapısı
-        database ve logger ile çalışır.
         """
 
         from core.migrations import MigrationManager
@@ -184,10 +200,7 @@ class PAGBot(commands.Bot):
 
     async def _start_discord_service(self) -> None:
         """
-        DiscordService varsa yaşam döngüsünü başlatır.
-
-        Service start() metoduna sahipse çağrılır.
-        Böylece servis kullanılmadan önce hazır olur.
+        DiscordService varsa start() metodunu çalıştırır.
         """
 
         start_method = getattr(
@@ -197,6 +210,7 @@ class PAGBot(commands.Bot):
         )
 
         if start_method is None:
+
             self.logger.info(
                 "Discord service has no start hook.",
             )
@@ -215,10 +229,7 @@ class PAGBot(commands.Bot):
 
     async def _start_event_service(self) -> None:
         """
-        EventService başlangıç hook'unu çalıştırır.
-
-        EventService'in mevcut API'sine göre
-        kullanılabilir yaşam döngüsü metodunu çağırır.
+        EventService varsa start() metodunu çalıştırır.
         """
 
         start_method = getattr(
@@ -228,6 +239,7 @@ class PAGBot(commands.Bot):
         )
 
         if start_method is None:
+
             self.logger.info(
                 "Event service has no start hook.",
             )
@@ -248,24 +260,235 @@ class PAGBot(commands.Bot):
         """
         Discord bağlantısı hazır olduğunda çalışır.
 
-        Burada ağır initialization yapılmaz.
-        on_ready reconnect durumunda birden fazla kez
-        çalışabileceği için sadece durum loglanır.
+        Reconnect durumunda on_ready tekrar çalışabilir.
+        Bu nedenle ağır initialization burada yapılmaz.
         """
 
         if self.user is None:
+
             return
 
-        self.logger.info(
-            "Connected to Discord as %s (%s).",
-            self.user,
-            self.user.id,
-        )
+        if not self._ready_logged:
+
+            self.logger.info(
+                "Connected to Discord as %s (%s).",
+                self.user,
+                self.user.id,
+            )
+
+            self.logger.info(
+                "Connected guilds: %s.",
+                len(self.guilds),
+            )
+
+            self._ready_logged = True
+
+        else:
+
+            self.logger.info(
+                "Discord connection restored.",
+            )
+
+        self._start_presence_loop()
+
+        await self._update_presence()
+
+    # ========================================================
+    # PRESENCE LOOP
+    # ========================================================
+
+    def _start_presence_loop(self) -> None:
+        """
+        Presence loop'un yalnızca bir kez
+        başlatılmasını sağlar.
+        """
+
+        if self._presence_started:
+
+            return
+
+        if self.presence_loop.is_running():
+
+            self._presence_started = True
+
+            return
+
+        self.presence_loop.start()
+
+        self._presence_started = True
 
         self.logger.info(
-            "Connected guilds: %s.",
-            len(self.guilds),
+            "Presence rotation started.",
         )
+
+    # ========================================================
+    # PRESENCE ROTATION
+    # ========================================================
+
+    @tasks.loop(seconds=PRESENCE_INTERVAL)
+    async def presence_loop(self) -> None:
+        """
+        Bot activity bilgisini belirli aralıklarla
+        günceller.
+
+        Discord'a gereksiz istek atmamak için
+        60 saniyelik aralık kullanılır.
+        """
+
+        try:
+
+            await self._update_presence()
+
+        except discord.HTTPException as error:
+
+            self.logger.warning(
+                "Presence update failed: %s",
+                error,
+            )
+
+        except Exception:
+
+            self.logger.exception(
+                "Unexpected presence update error.",
+            )
+
+    # ========================================================
+    # PRESENCE LOOP READY
+    # ========================================================
+
+    @presence_loop.before_loop
+    async def before_presence_loop(self) -> None:
+        """
+        Presence loop başlamadan önce Discord
+        bağlantısının hazır olmasını bekler.
+        """
+
+        await self.wait_until_ready()
+
+    # ========================================================
+    # UPDATE PRESENCE
+    # ========================================================
+
+    async def _update_presence(self) -> None:
+        """
+        Botun canlı Discord presence bilgisini günceller.
+
+        Activity listesi zamana göre değişir.
+        """
+
+        if self.is_closed():
+
+            return
+
+        if self.user is None:
+
+            return
+
+        guild_count = len(
+            self.guilds,
+        )
+
+        member_count = sum(
+            guild.member_count or 0
+            for guild in self.guilds
+        )
+
+        command_count = len(
+            self.tree.get_commands(),
+        )
+
+        uptime = self._get_uptime()
+
+        activities = (
+            discord.Activity(
+                type=discord.ActivityType.watching,
+                name="/help",
+            ),
+            discord.Activity(
+                type=discord.ActivityType.playing,
+                name="PAG Community",
+            ),
+            discord.Activity(
+                type=discord.ActivityType.watching,
+                name=f"{member_count} PAG Members",
+            ),
+            discord.Activity(
+                type=discord.ActivityType.playing,
+                name=f"{command_count} Commands",
+            ),
+            discord.Activity(
+                type=discord.ActivityType.watching,
+                name=f"PAG | {guild_count} Server",
+            ),
+            discord.Activity(
+                type=discord.ActivityType.playing,
+                name=f"Online for {uptime}",
+            ),
+        )
+
+        current_index = (
+            int(
+                time.monotonic()
+                // self.PRESENCE_INTERVAL
+            )
+            % len(activities)
+        )
+
+        activity = activities[
+            current_index
+        ]
+
+        await self.change_presence(
+            status=discord.Status.online,
+            activity=activity,
+        )
+
+    # ========================================================
+    # UPTIME
+    # ========================================================
+
+    def _get_uptime(self) -> str:
+        """
+        Bot uptime bilgisini okunabilir formatta
+        döndürür.
+        """
+
+        elapsed = int(
+            time.monotonic()
+            - self._started_at
+        )
+
+        days, remainder = divmod(
+            elapsed,
+            86400,
+        )
+
+        hours, remainder = divmod(
+            remainder,
+            3600,
+        )
+
+        minutes, _ = divmod(
+            remainder,
+            60,
+        )
+
+        if days > 0:
+
+            return (
+                f"{days}d "
+                f"{hours}h "
+                f"{minutes}m"
+            )
+
+        if hours > 0:
+
+            return (
+                f"{hours}h "
+                f"{minutes}m"
+            )
+
+        return f"{minutes}m"
 
     # ========================================================
     # GUILD JOIN
@@ -276,9 +499,10 @@ class PAGBot(commands.Bot):
         guild: discord.Guild,
     ) -> None:
         """
-        Bot yalnızca yapılandırılmış PAG guild'inde çalışır.
+        Bot yalnızca yapılandırılmış PAG guild'inde
+        çalışır.
 
-        Başka bir sunucuya eklenirse otomatik olarak ayrılır.
+        Yetkisiz sunuculara otomatik olarak ayrılır.
         """
 
         allowed_guild_id = (
@@ -350,13 +574,15 @@ class PAGBot(commands.Bot):
         Prefix command hatalarını loglar.
 
         Slash command hataları ilgili Cog'ların
-        app command error handler'ları tarafından yönetilir.
+        app command error handler'ları tarafından
+        yönetilir.
         """
 
         if isinstance(
             exception,
             commands.CommandNotFound,
         ):
+
             return
 
         self.logger.error(
@@ -377,11 +603,13 @@ class PAGBot(commands.Bot):
         """
         Tüm servisleri kontrollü sırayla kapatır.
 
-        Kapanış sırasında herhangi bir kaynak açık
-        bırakılmaması amaçlanır.
+        Kapanış sırasında background task'ların,
+        Cog'ların, servislerin ve database'in
+        temizlenmesi amaçlanır.
         """
 
         if self._closed:
+
             return
 
         self._closed = True
@@ -389,6 +617,18 @@ class PAGBot(commands.Bot):
         self.logger.info(
             "Shutting down PAG Bot...",
         )
+
+        # ====================================================
+        # PRESENCE LOOP
+        # ====================================================
+
+        if self.presence_loop.is_running():
+
+            self.presence_loop.cancel()
+
+            self.logger.info(
+                "Presence rotation stopped.",
+            )
 
         # ====================================================
         # COGS
@@ -479,6 +719,7 @@ class PAGBot(commands.Bot):
         )
 
         if close_method is None:
+
             return
 
         try:
