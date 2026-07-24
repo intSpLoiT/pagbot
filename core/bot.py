@@ -29,6 +29,7 @@ class PAGBot(commands.Bot):
     - EventService yaşam döngüsü
     - Cog yükleme ve kaldırma
     - Guild kontrolü
+    - Slash command guild sync
     - Discord presence yönetimi
     - Kontrollü kapanış
     """
@@ -64,7 +65,20 @@ class PAGBot(commands.Bot):
         )
 
         self.config = config
+
         self.logger = logger
+
+        # ====================================================
+        # GUILD OBJECT
+        # ====================================================
+
+        self.guild_object = discord.Object(
+            id=config.discord_guild_id,
+        )
+
+        # ====================================================
+        # SERVICES
+        # ====================================================
 
         self.database = Database(
             database_path=config.database_path,
@@ -89,25 +103,43 @@ class PAGBot(commands.Bot):
             logger,
         )
 
+        # ====================================================
+        # STATE
+        # ====================================================
+
         self._started = False
+
         self._closed = False
+
         self._ready_logged = False
+
         self._presence_started = False
+
+        self._commands_synced = False
+
         self._started_at = time.monotonic()
 
     # ========================================================
     # SETUP HOOK
     # ========================================================
 
-    async def setup_hook(self) -> None:
+    async def setup_hook(
+        self,
+    ) -> None:
         """
         Discord bağlantısı kurulmadan önce çalışır.
 
-        Bu method Discord tarafından normalde
-        bağlantı başlangıcında bir kez çağrılır.
+        Initialization sırası:
 
-        Ağır initialization işlemleri burada
-        kontrollü şekilde yapılır.
+            Database
+                ↓
+            Migrations
+                ↓
+            Services
+                ↓
+            Cogs
+                ↓
+            Guild Slash Command Sync
         """
 
         if self._started:
@@ -162,9 +194,19 @@ class PAGBot(commands.Bot):
 
         # ====================================================
         # COGS
-        # ====================================================
+        # ========================================================
 
         await self.cog_loader.load_all()
+
+        # ====================================================
+        # SLASH COMMAND SYNC
+        # ====================================================
+
+        await self._sync_commands()
+
+        # ====================================================
+        # INITIALIZATION COMPLETE
+        # ====================================================
 
         self._started = True
 
@@ -173,10 +215,12 @@ class PAGBot(commands.Bot):
         )
 
     # ========================================================
-    # MIGRATIONS
+    # DATABASE MIGRATIONS
     # ========================================================
 
-    async def _run_migrations(self) -> None:
+    async def _run_migrations(
+        self,
+    ) -> None:
         """
         Database migration sistemini çalıştırır.
         """
@@ -195,10 +239,82 @@ class PAGBot(commands.Bot):
         )
 
     # ========================================================
+    # SLASH COMMAND SYNC
+    # ========================================================
+
+    async def _sync_commands(
+        self,
+    ) -> None:
+        """
+        Slash command'ları PAG guild'ine senkronize eder.
+
+        Guild sync kullanıldığı için komutlar
+        yalnızca yapılandırılmış sunucuda görünür.
+
+        Bu yöntem:
+
+            - Komut listesini Discord'a gönderir.
+            - Eski guild komutlarını günceller.
+            - Yeni komutları ekler.
+            - Silinen komutları temizler.
+            - Global command cache sorunlarını önler.
+        """
+
+        if self._commands_synced:
+
+            self.logger.debug(
+                "Slash commands already synchronized.",
+            )
+
+            return
+
+        try:
+
+            synced_commands = await self.tree.sync(
+                guild=self.guild_object,
+            )
+
+            self._commands_synced = True
+
+            self.logger.info(
+                "Slash commands synchronized.",
+            )
+
+            self.logger.info(
+                "Guild command count: %s.",
+                len(synced_commands),
+            )
+
+            for command in synced_commands:
+
+                self.logger.debug(
+                    "Synced command: /%s",
+                    command.name,
+                )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                "Failed to synchronize slash commands.",
+            )
+
+            raise
+
+        except Exception:
+
+            self.logger.exception(
+                "Unexpected slash command sync error.",
+            )
+
+            raise
+
+    # ========================================================
     # DISCORD SERVICE
     # ========================================================
 
-    async def _start_discord_service(self) -> None:
+    async def _start_discord_service(
+        self,
+    ) -> None:
         """
         DiscordService varsa start() metodunu çalıştırır.
         """
@@ -227,7 +343,9 @@ class PAGBot(commands.Bot):
     # EVENT SERVICE
     # ========================================================
 
-    async def _start_event_service(self) -> None:
+    async def _start_event_service(
+        self,
+    ) -> None:
         """
         EventService varsa start() metodunu çalıştırır.
         """
@@ -256,12 +374,14 @@ class PAGBot(commands.Bot):
     # READY
     # ========================================================
 
-    async def on_ready(self) -> None:
+    async def on_ready(
+        self,
+    ) -> None:
         """
         Discord bağlantısı hazır olduğunda çalışır.
 
-        Reconnect durumunda on_ready tekrar çalışabilir.
-        Bu nedenle ağır initialization burada yapılmaz.
+        Reconnect durumunda tekrar çalışabilir.
+        Ağır initialization burada yapılmaz.
         """
 
         if self.user is None:
@@ -297,7 +417,9 @@ class PAGBot(commands.Bot):
     # PRESENCE LOOP
     # ========================================================
 
-    def _start_presence_loop(self) -> None:
+    def _start_presence_loop(
+        self,
+    ) -> None:
         """
         Presence loop'un yalnızca bir kez
         başlatılmasını sağlar.
@@ -325,14 +447,15 @@ class PAGBot(commands.Bot):
     # PRESENCE ROTATION
     # ========================================================
 
-    @tasks.loop(seconds=PRESENCE_INTERVAL)
-    async def presence_loop(self) -> None:
+    @tasks.loop(
+        seconds=PRESENCE_INTERVAL,
+    )
+    async def presence_loop(
+        self,
+    ) -> None:
         """
         Bot activity bilgisini belirli aralıklarla
         günceller.
-
-        Discord'a gereksiz istek atmamak için
-        60 saniyelik aralık kullanılır.
         """
 
         try:
@@ -357,7 +480,9 @@ class PAGBot(commands.Bot):
     # ========================================================
 
     @presence_loop.before_loop
-    async def before_presence_loop(self) -> None:
+    async def before_presence_loop(
+        self,
+    ) -> None:
         """
         Presence loop başlamadan önce Discord
         bağlantısının hazır olmasını bekler.
@@ -369,11 +494,11 @@ class PAGBot(commands.Bot):
     # UPDATE PRESENCE
     # ========================================================
 
-    async def _update_presence(self) -> None:
+    async def _update_presence(
+        self,
+    ) -> None:
         """
-        Botun canlı Discord presence bilgisini günceller.
-
-        Activity listesi zamana göre değişir.
+        Botun Discord presence bilgisini günceller.
         """
 
         if self.is_closed():
@@ -394,7 +519,9 @@ class PAGBot(commands.Bot):
         )
 
         command_count = len(
-            self.tree.get_commands(),
+            self.tree.get_commands(
+                guild=self.guild_object,
+            ),
         )
 
         uptime = self._get_uptime()
@@ -404,22 +531,27 @@ class PAGBot(commands.Bot):
                 type=discord.ActivityType.watching,
                 name="/help",
             ),
+
             discord.Activity(
                 type=discord.ActivityType.playing,
                 name="PAG Community",
             ),
+
             discord.Activity(
                 type=discord.ActivityType.watching,
                 name=f"{member_count} PAG Members",
             ),
+
             discord.Activity(
                 type=discord.ActivityType.playing,
                 name=f"{command_count} Commands",
             ),
+
             discord.Activity(
                 type=discord.ActivityType.watching,
                 name=f"PAG | {guild_count} Server",
             ),
+
             discord.Activity(
                 type=discord.ActivityType.playing,
                 name=f"Online for {uptime}",
@@ -447,7 +579,9 @@ class PAGBot(commands.Bot):
     # UPTIME
     # ========================================================
 
-    def _get_uptime(self) -> str:
+    def _get_uptime(
+        self,
+    ) -> str:
         """
         Bot uptime bilgisini okunabilir formatta
         döndürür.
@@ -501,8 +635,6 @@ class PAGBot(commands.Bot):
         """
         Bot yalnızca yapılandırılmış PAG guild'inde
         çalışır.
-
-        Yetkisiz sunuculara otomatik olarak ayrılır.
         """
 
         allowed_guild_id = (
@@ -572,10 +704,6 @@ class PAGBot(commands.Bot):
     ) -> None:
         """
         Prefix command hatalarını loglar.
-
-        Slash command hataları ilgili Cog'ların
-        app command error handler'ları tarafından
-        yönetilir.
         """
 
         if isinstance(
@@ -599,13 +727,11 @@ class PAGBot(commands.Bot):
     # CLOSE
     # ========================================================
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
         """
-        Tüm servisleri kontrollü sırayla kapatır.
-
-        Kapanış sırasında background task'ların,
-        Cog'ların, servislerin ve database'in
-        temizlenmesi amaçlanır.
+        Tüm servisleri kontrollü şekilde kapatır.
         """
 
         if self._closed:
@@ -703,6 +829,7 @@ class PAGBot(commands.Bot):
     # SERVICE CLOSE HELPER
     # ========================================================
 
+  
     async def _close_service(
         self,
         service: Any,
