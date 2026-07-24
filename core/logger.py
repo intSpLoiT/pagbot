@@ -11,10 +11,23 @@ from typing import Final
 # ============================================================
 
 DEFAULT_LOG_LEVEL: Final[int] = logging.INFO
+
 DEFAULT_LOG_FORMAT: Final[str] = (
     "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 )
-DEFAULT_DATE_FORMAT: Final[str] = "%Y-%m-%d %H:%M:%S"
+
+DEFAULT_DATE_FORMAT: Final[str] = (
+    "%Y-%m-%d %H:%M:%S"
+)
+
+
+# ============================================================
+# GLOBAL LOGGER
+# ============================================================
+
+logger: logging.Logger = logging.getLogger(
+    "PAG"
+)
 
 
 # ============================================================
@@ -27,60 +40,118 @@ def setup_logger(
     log_file: str | Path | None = None,
 ) -> logging.Logger:
     """
-    PAG Bot için logger oluşturur veya mevcut logger'ı yapılandırır.
+    PAG Bot için logger oluşturur veya mevcut
+    logger'ı yapılandırır.
 
     Aynı logger birden fazla kez setup edilirse
     duplicate handler oluşturmaz.
     """
 
-    logger = logging.getLogger(name)
+    global logger
 
-    # Logger seviyesini ayarla
-    logger.setLevel(level)
+    configured_logger = logging.getLogger(
+        name
+    )
 
-    # Parent logger'dan gelen duplicate çıktıları engelle
-    logger.propagate = False
+    configured_logger.setLevel(
+        level
+    )
 
-    # Daha önce setup edilmişse tekrar handler ekleme
-    if logger.handlers:
-        return logger
+    configured_logger.propagate = False
 
     formatter = logging.Formatter(
         fmt=DEFAULT_LOG_FORMAT,
         datefmt=DEFAULT_DATE_FORMAT,
     )
 
-    # --------------------------------------------------------
+    # ========================================================
+    # EXISTING HANDLERS
+    # ========================================================
+
+    has_console_handler = any(
+        isinstance(
+            handler,
+            logging.StreamHandler,
+        )
+        and not isinstance(
+            handler,
+            logging.FileHandler,
+        )
+        for handler in configured_logger.handlers
+    )
+
+    has_file_handler = any(
+        isinstance(
+            handler,
+            logging.FileHandler,
+        )
+        for handler in configured_logger.handlers
+    )
+
+    # ========================================================
     # CONSOLE HANDLER
-    # --------------------------------------------------------
+    # ========================================================
 
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
+    if not has_console_handler:
 
-    logger.addHandler(console_handler)
+        console_handler = logging.StreamHandler(
+            sys.stdout
+        )
 
-    # --------------------------------------------------------
+        console_handler.setLevel(
+            level
+        )
+
+        console_handler.setFormatter(
+            formatter
+        )
+
+        configured_logger.addHandler(
+            console_handler
+        )
+
+    # ========================================================
     # FILE HANDLER
-    # --------------------------------------------------------
+    # ========================================================
 
-    if log_file is not None:
-        log_path = Path(log_file)
+    if (
+        log_file is not None
+        and not has_file_handler
+    ):
 
-        # Log klasörü yoksa oluştur
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path = Path(
+            log_file
+        )
+
+        log_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         file_handler = logging.FileHandler(
             filename=log_path,
             encoding="utf-8",
         )
 
-        file_handler.setLevel(level)
-        file_handler.setFormatter(formatter)
+        file_handler.setLevel(
+            level
+        )
 
-        logger.addHandler(file_handler)
+        file_handler.setFormatter(
+            formatter
+        )
 
-    return logger
+        configured_logger.addHandler(
+            file_handler
+        )
+
+    # ========================================================
+    # GLOBAL LOGGER REFERENCE
+    # ========================================================
+
+    logger = configured_logger
+
+    return configured_logger
 
 
 # ============================================================
@@ -94,47 +165,92 @@ class PAGLogger:
     Logger setup işlemi bu class'ın dışında yapılır.
     """
 
-    def __init__(self, name: str = "PAG"):
-        self._logger = logging.getLogger(name)
+    def __init__(
+        self,
+        name: str = "PAG",
+    ) -> None:
 
-    # --------------------------------------------------------
+        self._logger = logging.getLogger(
+            name
+        )
+
+    # ========================================================
     # INFO
-    # --------------------------------------------------------
+    # ========================================================
 
-    def info(self, message: str) -> None:
-        self._logger.info(message)
+    def info(
+        self,
+        message: str,
+        *args: object,
+    ) -> None:
 
-    # --------------------------------------------------------
+        self._logger.info(
+            message,
+            *args,
+        )
+
+    # ========================================================
     # WARNING
-    # --------------------------------------------------------
+    # ========================================================
 
-    def warning(self, message: str) -> None:
-        self._logger.warning(message)
+    def warning(
+        self,
+        message: str,
+        *args: object,
+    ) -> None:
 
-    # --------------------------------------------------------
+        self._logger.warning(
+            message,
+            *args,
+        )
+
+    # ========================================================
     # ERROR
-    # --------------------------------------------------------
+    # ========================================================
 
-    def error(self, message: str) -> None:
-        self._logger.error(message)
+    def error(
+        self,
+        message: str,
+        *args: object,
+    ) -> None:
 
-    # --------------------------------------------------------
+        self._logger.error(
+            message,
+            *args,
+        )
+
+    # ========================================================
     # DEBUG
-    # --------------------------------------------------------
+    # ========================================================
 
-    def debug(self, message: str) -> None:
-        self._logger.debug(message)
+    def debug(
+        self,
+        message: str,
+        *args: object,
+    ) -> None:
 
-    # --------------------------------------------------------
+        self._logger.debug(
+            message,
+            *args,
+        )
+
+    # ========================================================
     # EXCEPTION
-    # --------------------------------------------------------
+    # ========================================================
 
-    def exception(self, message: str) -> None:
+    def exception(
+        self,
+        message: str,
+        *args: object,
+    ) -> None:
         """
         Exception sırasında kullanılır.
 
-        Kullanıldığı yerde mevcut exception'ın
-        traceback bilgisini de loglar.
+        Mevcut exception'ın traceback bilgisini
+        de loglar.
         """
 
-        self._logger.exception(message)
+        self._logger.exception(
+            message,
+            *args,
+        )
