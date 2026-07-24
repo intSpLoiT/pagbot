@@ -414,7 +414,7 @@ class ProfileCog(commands.Cog):
 
 
     @app_commands.command(
-        name="profile",
+        name="profile-2",
         description=(
             "Display a PAG member profile."
         ),
