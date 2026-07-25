@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from collections import deque
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -24,8 +23,7 @@ from services.roblox_service import (
 # ============================================================
 
 MAX_REASON_LENGTH = 1000
-MAX_PANEL_NOTE_LENGTH = 1500
-MAX_QUICK_RAW_LENGTH = 3000
+MAX_RAW_LENGTH = 3000
 PANEL_TIMEOUT_SECONDS = 300
 PREVIEW_TIMEOUT_SECONDS = 180
 
@@ -56,22 +54,6 @@ CANCEL_MARKERS = {
 
 @dataclass(slots=True, frozen=True)
 class BlacklistDraft:
-    """
-    Panelde toplanan veriler.
-
-    discord_id:
-        Discord target varsa tutulur.
-
-    roblox_id / roblox_username:
-        Roblox target varsa tutulur.
-
-    reason:
-        Blacklist sebebi.
-
-    kick_now:
-        Kayıt sırasında hedef server'daysa kick edilsin mi.
-    """
-
     discord_id: int | None = None
     discord_label: str | None = None
 
@@ -83,38 +65,39 @@ class BlacklistDraft:
     reason: str = "Sebep belirtilmedi."
     kick_now: bool = True
 
+    announcement_channel_id: int | None = None
+
     @property
     def is_ready(self) -> bool:
-        return self.discord_id is not None or self.roblox_id is not None
+        return self.discord_id is not None or self.roblox_username is not None
 
 
 @dataclass(slots=True)
 class BlacklistSession:
-    """
-    Panel oturumu.
-
-    Her yönetici için tek aktif oturum tutulur.
-    Panel kapanınca veya timeout olunca silinir.
-    """
-
     draft: BlacklistDraft
     panel_channel_id: int | None = None
     panel_message_id: int | None = None
-    current_view: str = "main"  # main | detail | preview | manage | history
+    current_view: str = "main"  # main | preview | manage
 
 
 @dataclass(slots=True)
 class BlacklistResolvedTarget:
-    """
-    Blacklist işlemi için çözülmüş hedef.
-    """
-
     discord_member: discord.Member | None = None
     discord_id: int | None = None
+
     roblox_id: int | None = None
     roblox_username: str | None = None
     roblox_display_name: str | None = None
     avatar_url: str | None = None
+
+
+@dataclass(slots=True)
+class BlacklistOperation:
+    success: bool
+    message: str
+    embed: discord.Embed | None = None
+    kicked: bool = False
+    kick_error: str | None = None
 
 
 # ============================================================
@@ -146,11 +129,7 @@ def _is_cancel(text: str) -> bool:
 
 
 def _parse_discord_id(value: str) -> int | None:
-    """
-    Mention / ID / boşluklu girişten Discord ID çıkarmaya çalışır.
-    """
     raw = value.strip()
-
     if not raw:
         return None
 
@@ -169,8 +148,8 @@ def _parse_roblox_username_hint(value: str) -> str | None:
     if not raw:
         return None
 
-    if raw.lower().startswith(("roblox:", "rbx:", "rbx=")):
-        raw = raw.split(":", 1)[-1].split("=", 1)[-1].strip()
+    if raw.lower().startswith(("roblox:", "rbx:", "username:")):
+        raw = raw.split(":", 1)[1].strip()
 
     if not raw:
         return None
@@ -179,7 +158,267 @@ def _parse_roblox_username_hint(value: str) -> str | None:
 
 
 # ============================================================
-# PAGES / VIEWS
+# MODALS
+# ============================================================
+
+
+class BlacklistQuickModal(discord.ui.Modal, title="PAG Blacklist • Hızlı Giriş"):
+    raw = discord.ui.TextInput(
+        label="Tek Satır Giriş",
+        placeholder="discord:@user | roblox:Username | reason:Sebep",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        min_length=1,
+        max_length=MAX_RAW_LENGTH,
+    )
+
+    def __init__(self, cog: "Blacklist") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.InteractionResponded:
+            return
+
+        draft = self.cog.parse_quick_input(self.raw.value)
+        if draft is None:
+            await self.cog.safe_followup(
+                interaction,
+                "❌ Tek satır formatı çözümlenemedi.",
+            )
+            return
+
+        error = self.cog.validate_draft(draft)
+        if error:
+            await self.cog.safe_followup(interaction, f"❌ {error}")
+            return
+
+        self.cog.set_session(
+            interaction.user.id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="main",
+        )
+
+        await self.cog.refresh_panel_message(
+            author_id=interaction.user.id,
+            notice="✅ Hızlı giriş uygulandı.",
+        )
+
+
+class BlacklistDiscordModal(discord.ui.Modal, title="PAG Blacklist • Discord Hedef"):
+    target = discord.ui.TextInput(
+        label="Discord Kullanıcı ID / Mention",
+        placeholder="@user veya 1234567890",
+        required=True,
+        min_length=1,
+        max_length=50,
+    )
+    reason = discord.ui.TextInput(
+        label="Sebep",
+        placeholder="Sebep belirtilmedi.",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=MAX_REASON_LENGTH,
+    )
+
+    def __init__(self, cog: "Blacklist") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.InteractionResponded:
+            return
+
+        discord_id = _parse_discord_id(self.target.value)
+        if discord_id is None:
+            await self.cog.safe_followup(
+                interaction,
+                "❌ Geçerli bir Discord ID veya mention gir.",
+            )
+            return
+
+        draft = self.cog.get_draft(interaction.user.id) or BlacklistDraft()
+        draft = replace(
+            draft,
+            discord_id=discord_id,
+            discord_label=self.target.value.strip(),
+            reason=self.cog.normalize_reason(self.reason.value),
+        )
+
+        error = self.cog.validate_draft(draft)
+        if error:
+            await self.cog.safe_followup(interaction, f"❌ {error}")
+            return
+
+        self.cog.set_session(
+            interaction.user.id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="main",
+        )
+
+        await self.cog.refresh_panel_message(
+            author_id=interaction.user.id,
+            notice="✅ Discord hedefi kaydedildi.",
+        )
+
+
+class BlacklistRobloxModal(discord.ui.Modal, title="PAG Blacklist • Roblox Hedef"):
+    username = discord.ui.TextInput(
+        label="Roblox Kullanıcı Adı",
+        placeholder="Roblox username",
+        required=True,
+        min_length=3,
+        max_length=20,
+    )
+    reason = discord.ui.TextInput(
+        label="Sebep",
+        placeholder="Sebep belirtilmedi.",
+        style=discord.TextStyle.paragraph,
+        required=False,
+        max_length=MAX_REASON_LENGTH,
+    )
+
+    def __init__(self, cog: "Blacklist") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.InteractionResponded:
+            return
+
+        username = _parse_roblox_username_hint(self.username.value)
+        if not username:
+            await self.cog.safe_followup(
+                interaction,
+                "❌ Roblox kullanıcı adı boş olamaz.",
+            )
+            return
+
+        draft = self.cog.get_draft(interaction.user.id) or BlacklistDraft()
+        draft = replace(
+            draft,
+            roblox_username=username,
+            reason=self.cog.normalize_reason(self.reason.value),
+        )
+
+        try:
+            target = await self.cog.resolve_roblox_target(username)
+        except RobloxNotFoundError:
+            await self.cog.safe_followup(interaction, "❌ Roblox kullanıcısı bulunamadı.")
+            return
+        except RobloxAPIError:
+            self.cog.logger.exception("Roblox API error while resolving target.")
+            await self.cog.safe_followup(interaction, "❌ Roblox API hatası oluştu.")
+            return
+        except Exception:
+            self.cog.logger.exception("Unexpected error while resolving Roblox target.")
+            await self.cog.safe_followup(
+                interaction,
+                "❌ Roblox hedefi çözümlenirken beklenmeyen bir hata oluştu.",
+            )
+            return
+
+        draft = replace(
+            draft,
+            roblox_id=target.roblox_id,
+            roblox_username=target.roblox_username,
+            roblox_display_name=target.roblox_display_name,
+            avatar_url=target.avatar_url,
+        )
+
+        self.cog.set_session(
+            interaction.user.id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="main",
+        )
+
+        await self.cog.refresh_panel_message(
+            author_id=interaction.user.id,
+            notice="✅ Roblox hedefi kaydedildi.",
+        )
+
+
+class BlacklistReasonModal(discord.ui.Modal, title="PAG Blacklist • Sebep"):
+    reason = discord.ui.TextInput(
+        label="Sebep",
+        placeholder="Blacklist sebebi...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        min_length=1,
+        max_length=MAX_REASON_LENGTH,
+    )
+
+    def __init__(self, cog: "Blacklist") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.InteractionResponded:
+            return
+
+        draft = self.cog.get_draft(interaction.user.id)
+        if draft is None:
+            await self.cog.safe_followup(interaction, "❌ Panel oturumu bulunamadı.")
+            return
+
+        draft = replace(draft, reason=self.cog.normalize_reason(self.reason.value))
+        self.cog.set_session(
+            interaction.user.id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="main",
+        )
+
+        await self.cog.refresh_panel_message(
+            author_id=interaction.user.id,
+            notice="✅ Sebep güncellendi.",
+        )
+
+
+class BlacklistRemoveModal(discord.ui.Modal, title="PAG Blacklist • Kaldır"):
+    target = discord.ui.TextInput(
+        label="Discord ID / Roblox Username",
+        placeholder="1234567890 veya RobloxAdı",
+        required=True,
+        min_length=1,
+        max_length=50,
+    )
+
+    def __init__(self, cog: "Blacklist") -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        try:
+            await interaction.response.defer(ephemeral=True)
+        except discord.InteractionResponded:
+            return
+
+        result = await self.cog.remove_by_text(
+            moderator=interaction.user,
+            target_text=self.target.value,
+            announce_channel_id=interaction.channel_id,
+        )
+
+        await self.cog.safe_followup(
+            interaction,
+            result.message,
+        )
+
+
+# ============================================================
+# VIEWS
 # ============================================================
 
 
@@ -232,531 +471,6 @@ class BlacklistBaseView(discord.ui.View):
         self.cog.clear_session(self.author_id)
 
 
-class BlacklistQuickModal(discord.ui.Modal):
-    """
-    Hızlı giriş paneli.
-
-    Tek satır formatı:
-        discord:<id|mention> | roblox:<username> | reason
-
-    Parçalar isteğe bağlıdır, ama en az bir hedef olmalı.
-    """
-
-    def __init__(self, cog: "Blacklist") -> None:
-        super().__init__(title="PAG Blacklist • Hızlı Giriş")
-        self.cog = cog
-
-        self.raw = discord.ui.TextInput(
-            label="Tek Satır",
-            placeholder="discord:@user | roblox:Username | sebep",
-            style=discord.TextStyle.paragraph,
-            required=True,
-            min_length=1,
-            max_length=MAX_QUICK_RAW_LENGTH,
-        )
-        self.add_item(self.raw)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.InteractionResponded:
-            return
-        except discord.HTTPException:
-            self.cog.logger.exception("Quick modal defer failed.")
-            return
-
-        draft = self.cog.parse_quick_input(self.raw.value)
-        if draft is None:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Tek satır formatı çözümlenemedi.",
-            )
-            return
-
-        if not draft.is_ready:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ En az bir hedef belirtmelisin. Discord kullanıcısı veya Roblox kullanıcı adı gir.",
-            )
-            return
-
-        validation_error = self.cog.validate_draft(draft)
-        if validation_error:
-            await self.cog.safe_followup(
-                interaction,
-                f"❌ {validation_error}",
-            )
-            return
-
-        self.cog.set_session(interaction.user.id, draft=draft)
-
-        await self.cog.refresh_panel_message(
-            author_id=interaction.user.id,
-            notice="✅ Hızlı giriş uygulandı.",
-        )
-
-
-class BlacklistDiscordModal(discord.ui.Modal):
-    def __init__(self, cog: "Blacklist") -> None:
-        super().__init__(title="PAG Blacklist • Discord Hedef")
-        self.cog = cog
-
-        self.target_input = discord.ui.TextInput(
-            label="Discord Kullanıcı ID / Mention",
-            placeholder="@user veya 1234567890",
-            required=True,
-            min_length=1,
-            max_length=50,
-        )
-        self.reason_input = discord.ui.TextInput(
-            label="Sebep",
-            placeholder="Sebep belirtilmedi.",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=MAX_REASON_LENGTH,
-        )
-        self.add_item(self.target_input)
-        self.add_item(self.reason_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.InteractionResponded:
-            return
-
-        discord_id = _parse_discord_id(self.target_input.value)
-        if discord_id is None:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Geçerli bir Discord ID veya mention gir.",
-            )
-            return
-
-        draft = self.cog.get_draft(interaction.user.id) or BlacklistDraft()
-        draft = replace(
-            draft,
-            discord_id=discord_id,
-            discord_label=self.target_input.value.strip(),
-            reason=self.cog.normalize_reason(self.reason_input.value),
-        )
-
-        validation_error = self.cog.validate_draft(draft)
-        if validation_error:
-            await self.cog.safe_followup(
-                interaction,
-                f"❌ {validation_error}",
-            )
-            return
-
-        self.cog.set_session(interaction.user.id, draft=draft)
-
-        await self.cog.refresh_panel_message(
-            author_id=interaction.user.id,
-            notice="✅ Discord hedefi kaydedildi.",
-        )
-
-
-class BlacklistRobloxModal(discord.ui.Modal):
-    def __init__(self, cog: "Blacklist") -> None:
-        super().__init__(title="PAG Blacklist • Roblox Hedef")
-        self.cog = cog
-
-        self.username_input = discord.ui.TextInput(
-            label="Roblox Kullanıcı Adı",
-            placeholder="Roblox username",
-            required=True,
-            min_length=3,
-            max_length=20,
-        )
-        self.reason_input = discord.ui.TextInput(
-            label="Sebep",
-            placeholder="Sebep belirtilmedi.",
-            style=discord.TextStyle.paragraph,
-            required=False,
-            max_length=MAX_REASON_LENGTH,
-        )
-        self.add_item(self.username_input)
-        self.add_item(self.reason_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.InteractionResponded:
-            return
-
-        username = _parse_roblox_username_hint(self.username_input.value)
-        if not username:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Roblox kullanıcı adı boş olamaz.",
-            )
-            return
-
-        draft = self.cog.get_draft(interaction.user.id) or BlacklistDraft()
-        draft = replace(
-            draft,
-            roblox_username=username,
-            reason=self.cog.normalize_reason(self.reason_input.value),
-        )
-
-        validation_error = self.cog.validate_draft(draft)
-        if validation_error:
-            await self.cog.safe_followup(
-                interaction,
-                f"❌ {validation_error}",
-            )
-            return
-
-        try:
-            target = await self.cog.resolve_roblox_target(username)
-        except RobloxNotFoundError:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Roblox kullanıcısı bulunamadı.",
-            )
-            return
-        except RobloxAPIError:
-            self.cog.logger.exception("Roblox API error while resolving target.")
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Roblox API hatası oluştu.",
-            )
-            return
-        except Exception:
-            self.cog.logger.exception("Unexpected error while resolving Roblox target.")
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Roblox hedefi çözümlenirken beklenmeyen bir hata oluştu.",
-            )
-            return
-
-        draft = replace(
-            draft,
-            roblox_id=target.roblox_id,
-            roblox_display_name=target.roblox_display_name,
-            avatar_url=target.avatar_url,
-            roblox_username=target.roblox_username,
-        )
-
-        self.cog.set_session(interaction.user.id, draft=draft)
-
-        await self.cog.refresh_panel_message(
-            author_id=interaction.user.id,
-            notice="✅ Roblox hedefi kaydedildi.",
-        )
-
-
-class BlacklistReasonModal(discord.ui.Modal):
-    def __init__(self, cog: "Blacklist") -> None:
-        super().__init__(title="PAG Blacklist • Sebep")
-        self.cog = cog
-
-        self.reason_input = discord.ui.TextInput(
-            label="Sebep",
-            placeholder="Blacklist sebebi...",
-            style=discord.TextStyle.paragraph,
-            required=True,
-            min_length=1,
-            max_length=MAX_REASON_LENGTH,
-        )
-        self.add_item(self.reason_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.InteractionResponded:
-            return
-
-        draft = self.cog.get_draft(interaction.user.id)
-        if draft is None:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Panel oturumu bulunamadı.",
-            )
-            return
-
-        draft = replace(
-            draft,
-            reason=self.cog.normalize_reason(self.reason_input.value),
-        )
-        self.cog.set_session(interaction.user.id, draft=draft)
-
-        await self.cog.refresh_panel_message(
-            author_id=interaction.user.id,
-            notice="✅ Sebep güncellendi.",
-        )
-
-
-class BlacklistRemoveModal(discord.ui.Modal):
-    def __init__(self, cog: "Blacklist") -> None:
-        super().__init__(title="PAG Blacklist • Kaldır")
-        self.cog = cog
-
-        self.target_input = discord.ui.TextInput(
-            label="Discord ID / Roblox Username",
-            placeholder="1234567890 veya RobloxAdı",
-            required=True,
-            min_length=1,
-            max_length=50,
-        )
-        self.add_item(self.target_input)
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        try:
-            await interaction.response.defer(ephemeral=True)
-        except discord.InteractionResponded:
-            return
-
-        target_text = self.target_input.value.strip()
-        if not target_text:
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Hedef boş olamaz.",
-            )
-            return
-
-        operation = await self.cog.remove_by_text(
-            moderator=interaction.user,
-            target_text=target_text,
-        )
-
-        await self.cog.safe_followup(
-            interaction,
-            operation.message or "✅ Kayıt kaldırıldı.",
-        )
-
-
-class BlacklistPreviewView(BlacklistBaseView):
-    def __init__(
-        self,
-        cog: "Blacklist",
-        author_id: int,
-    ) -> None:
-        super().__init__(cog, author_id, timeout=PREVIEW_TIMEOUT_SECONDS)
-
-    @discord.ui.button(
-        label="Blacklist & Kick",
-        emoji="🚫",
-        style=discord.ButtonStyle.danger,
-        row=0,
-    )
-    async def send_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        if self.cog.get_draft(self.author_id) is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            result = await self.cog.execute_blacklist(
-                moderator=interaction.user,
-                kick_now=True,
-            )
-        except Exception:
-            self.cog.logger.exception("Blacklist execution failed.")
-            await self.cog.safe_followup(
-                interaction,
-                "❌ Blacklist işlemi sırasında beklenmeyen bir hata oluştu.",
-            )
-            return
-
-        await self.cog.safe_followup(
-            interaction,
-            result.message or "✅ Blacklist tamamlandı.",
-        )
-        self.cog.clear_session(self.author_id)
-
-    @discord.ui.button(
-        label="Düzenle",
-        emoji="✏️",
-        style=discord.ButtonStyle.primary,
-        row=0,
-    )
-    async def edit_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        draft = self.cog.get_draft(self.author_id)
-        if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.edit_message(
-            embed=await self.cog.build_panel_embed(
-                draft,
-                panel_name="Ana Panel",
-            ),
-            view=self.cog.build_view("main", self.author_id),
-        )
-
-    @discord.ui.button(
-        label="Geri",
-        emoji="↩️",
-        style=discord.ButtonStyle.secondary,
-        row=0,
-    )
-    async def back_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        draft = self.cog.get_draft(self.author_id)
-        if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.edit_message(
-            embed=await self.cog.build_panel_embed(
-                draft,
-                panel_name="Ana Panel",
-            ),
-            view=self.cog.build_view("main", self.author_id),
-        )
-
-    @discord.ui.button(
-        label="İptal",
-        emoji="✖️",
-        style=discord.ButtonStyle.secondary,
-        row=0,
-    )
-    async def cancel_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        self.cog.clear_session(self.author_id)
-
-        for child in self.children:
-            child.disabled = True
-
-        try:
-            await interaction.response.edit_message(
-                content="❎ İşlem iptal edildi.",
-                embed=None,
-                view=None,
-            )
-        except discord.HTTPException:
-            await interaction.response.send_message(
-                "❎ İşlem iptal edildi.",
-                ephemeral=True,
-            )
-
-
-class BlacklistManageView(BlacklistBaseView):
-    def __init__(self, cog: "Blacklist", author_id: int) -> None:
-        super().__init__(cog, author_id, timeout=PANEL_TIMEOUT_SECONDS)
-
-    @discord.ui.button(
-        label="Kaldır",
-        emoji="🗑️",
-        style=discord.ButtonStyle.danger,
-        row=0,
-    )
-    async def remove_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_modal(
-            BlacklistRemoveModal(self.cog),
-        )
-
-    @discord.ui.button(
-        label="Durum",
-        emoji="📊",
-        style=discord.ButtonStyle.primary,
-        row=0,
-    )
-    async def status_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        draft = self.cog.get_draft(self.author_id)
-        if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.edit_message(
-            embed=await self.cog.build_status_embed(
-                draft,
-                moderator=interaction.user,
-            ),
-            view=self,
-        )
-
-    @discord.ui.button(
-        label="Geri",
-        emoji="↩️",
-        style=discord.ButtonStyle.secondary,
-        row=0,
-    )
-    async def back_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        draft = self.cog.get_draft(self.author_id)
-        if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.edit_message(
-            embed=await self.cog.build_panel_embed(
-                draft,
-                panel_name="Ana Panel",
-            ),
-            view=self.cog.build_view("main", self.author_id),
-        )
-
-    @discord.ui.button(
-        label="İptal",
-        emoji="✖️",
-        style=discord.ButtonStyle.secondary,
-        row=0,
-    )
-    async def cancel_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        self.cog.clear_session(self.author_id)
-        for child in self.children:
-            child.disabled = True
-
-        try:
-            await interaction.response.edit_message(
-                content="❎ Yönetim paneli kapatıldı.",
-                embed=None,
-                view=None,
-            )
-        except discord.HTTPException:
-            await interaction.response.send_message(
-                "❎ Yönetim paneli kapatıldı.",
-                ephemeral=True,
-            )
-
-
 class BlacklistMainView(BlacklistBaseView):
     @discord.ui.button(
         label="Discord Hedef",
@@ -764,14 +478,8 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.primary,
         row=0,
     )
-    async def discord_target_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_modal(
-            BlacklistDiscordModal(self.cog),
-        )
+    async def discord_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BlacklistDiscordModal(self.cog))
 
     @discord.ui.button(
         label="Roblox Hedef",
@@ -779,14 +487,8 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.primary,
         row=0,
     )
-    async def roblox_target_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_modal(
-            BlacklistRobloxModal(self.cog),
-        )
+    async def roblox_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BlacklistRobloxModal(self.cog))
 
     @discord.ui.button(
         label="Sebep",
@@ -794,14 +496,8 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.secondary,
         row=0,
     )
-    async def reason_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_modal(
-            BlacklistReasonModal(self.cog),
-        )
+    async def reason_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BlacklistReasonModal(self.cog))
 
     @discord.ui.button(
         label="Tek Satır",
@@ -809,14 +505,8 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.success,
         row=1,
     )
-    async def quick_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        await interaction.response.send_modal(
-            BlacklistQuickModal(self.cog),
-        )
+    async def quick_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BlacklistQuickModal(self.cog))
 
     @discord.ui.button(
         label="Önizleme",
@@ -824,17 +514,10 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.secondary,
         row=1,
     )
-    async def preview_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+    async def preview_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         draft = self.cog.get_draft(self.author_id)
         if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
             return
 
         await interaction.response.edit_message(
@@ -848,25 +531,37 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.secondary,
         row=1,
     )
-    async def manage_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+    async def manage_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         draft = self.cog.get_draft(self.author_id)
         if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
             return
 
         await interaction.response.edit_message(
-            embed=await self.cog.build_status_embed(
-                draft,
-                moderator=interaction.user,
-            ),
+            embed=await self.cog.build_manage_embed(draft),
             view=self.cog.build_view("manage", self.author_id),
+        )
+
+    @discord.ui.button(
+        label="Blacklist",
+        emoji="🚫",
+        style=discord.ButtonStyle.danger,
+        row=2,
+    )
+    async def apply_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        draft = self.cog.get_draft(self.author_id)
+        if draft is None:
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
+            return
+
+        error = self.cog.validate_draft(draft)
+        if error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            embed=await self.cog.build_preview_embed(draft),
+            view=self.cog.build_view("preview", self.author_id),
         )
 
     @discord.ui.button(
@@ -875,24 +570,14 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.secondary,
         row=2,
     )
-    async def everyone_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        draft = self.cog.toggle_everyone(self.author_id)
+    async def everyone_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        draft = self.cog.toggle_kick(self.author_id)
         if draft is None:
-            await interaction.response.send_message(
-                "❌ Panel oturumu bulunamadı.",
-                ephemeral=True,
-            )
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
             return
 
         await interaction.response.edit_message(
-            embed=await self.cog.build_panel_embed(
-                draft,
-                panel_name="Ana Panel",
-            ),
+            embed=await self.cog.build_panel_embed(draft, panel_name="Ana Panel"),
             view=self,
         )
 
@@ -902,15 +587,8 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.danger,
         row=2,
     )
-    async def reset_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-        self.cog.set_session(
-            self.author_id,
-            BlacklistDraft(),
-        )
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.cog.set_session(self.author_id, BlacklistDraft(), channel_id=interaction.channel_id, current_view="main")
         await interaction.response.edit_message(
             embed=await self.cog.build_panel_embed(
                 self.cog.get_draft(self.author_id) or BlacklistDraft(),
@@ -925,11 +603,7 @@ class BlacklistMainView(BlacklistBaseView):
         style=discord.ButtonStyle.secondary,
         row=2,
     )
-    async def close_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.cog.clear_session(self.author_id)
 
         for child in self.children:
@@ -942,10 +616,227 @@ class BlacklistMainView(BlacklistBaseView):
                 view=None,
             )
         except discord.HTTPException:
-            await interaction.response.send_message(
-                "❎ Blacklist paneli kapatıldı.",
+            await interaction.response.send_message("❎ Blacklist paneli kapatıldı.", ephemeral=True)
+
+
+class BlacklistPreviewView(BlacklistBaseView):
+    def __init__(self, cog: "Blacklist", author_id: int) -> None:
+        super().__init__(cog, author_id, timeout=PREVIEW_TIMEOUT_SECONDS)
+        self._sending = False
+
+    @discord.ui.button(
+        label="Blacklist & Kick",
+        emoji="✅",
+        style=discord.ButtonStyle.danger,
+        row=0,
+    )
+    async def send_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self._sending:
+            await interaction.response.send_message("⏳ İşlem zaten sürüyor.", ephemeral=True)
+            return
+
+        draft = self.cog.get_draft(self.author_id)
+        if draft is None:
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
+            return
+
+        error = self.cog.validate_draft(draft)
+        if error:
+            await interaction.response.send_message(f"❌ {error}", ephemeral=True)
+            return
+
+        self._sending = True
+
+        try:
+            await interaction.response.defer(ephemeral=True)
+            result = await self.cog.execute_blacklist(
+                moderator=interaction.user,
+                kick_now=draft.kick_now,
+                announce_channel_id=interaction.channel_id,
+            )
+
+            if result.embed is not None:
+                await self.cog.send_public_embed(interaction.channel_id, result.embed)
+
+            self.cog.clear_session(self.author_id)
+
+            for child in self.children:
+                child.disabled = True
+
+            try:
+                await interaction.edit_original_response(
+                    content=result.message,
+                    embed=None,
+                    view=None,
+                )
+            except discord.HTTPException:
+                pass
+
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "❌ Discord botun bu üyeyi işlemeye yetkili değil.",
                 ephemeral=True,
             )
+        except discord.NotFound:
+            await interaction.followup.send(
+                "❌ Kanal veya interaction artık bulunamıyor.",
+                ephemeral=True,
+            )
+        except discord.HTTPException:
+            self.cog.logger.exception("Discord API error while sending blacklist.")
+            await interaction.followup.send(
+                "❌ Discord API hatası oluştu.",
+                ephemeral=True,
+            )
+        except Exception:
+            self.cog.logger.exception("Unexpected error while sending blacklist.")
+            await interaction.followup.send(
+                "❌ Blacklist işlemi sırasında beklenmeyen bir hata oluştu.",
+                ephemeral=True,
+            )
+        finally:
+            self._sending = False
+
+    @discord.ui.button(
+        label="Düzenle",
+        emoji="✏️",
+        style=discord.ButtonStyle.primary,
+        row=0,
+    )
+    async def edit_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        draft = self.cog.get_draft(self.author_id)
+        if draft is None:
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            embed=await self.cog.build_panel_embed(draft, panel_name="Ana Panel"),
+            view=self.cog.build_view("main", self.author_id),
+        )
+
+    @discord.ui.button(
+        label="Ana Panel",
+        emoji="🏠",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+    )
+    async def main_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        draft = self.cog.get_draft(self.author_id)
+        if draft is None:
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            embed=await self.cog.build_panel_embed(draft, panel_name="Ana Panel"),
+            view=self.cog.build_view("main", self.author_id),
+        )
+
+    @discord.ui.button(
+        label="İptal",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+    )
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.cog.clear_session(self.author_id)
+
+        for child in self.children:
+            child.disabled = True
+
+        try:
+            await interaction.response.edit_message(
+                content="❎ Blacklist işlemi iptal edildi.",
+                embed=None,
+                view=None,
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message("❎ Blacklist işlemi iptal edildi.", ephemeral=True)
+
+
+class BlacklistManageView(BlacklistBaseView):
+    @discord.ui.button(
+        label="Kaldır",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+        row=0,
+    )
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BlacklistRemoveModal(self.cog))
+
+    @discord.ui.button(
+        label="Geçmiş",
+        emoji="📜",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+    )
+    async def history_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(
+            embed=await self.cog.build_history_embed(),
+            view=self,
+        )
+
+    @discord.ui.button(
+        label="Duyuru Kanalı",
+        emoji="📢",
+        style=discord.ButtonStyle.secondary,
+        row=0,
+    )
+    async def channel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        draft = self.cog.get_draft(self.author_id)
+        if draft is None:
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
+            return
+
+        draft = replace(draft, announcement_channel_id=interaction.channel_id)
+        self.cog.set_session(
+            self.author_id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="manage",
+        )
+
+        await interaction.response.edit_message(
+            embed=await self.cog.build_manage_embed(draft),
+            view=self,
+        )
+
+    @discord.ui.button(
+        label="Geri",
+        emoji="↩️",
+        style=discord.ButtonStyle.primary,
+        row=1,
+    )
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        draft = self.cog.get_draft(self.author_id)
+        if draft is None:
+            await interaction.response.send_message("❌ Panel oturumu bulunamadı.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(
+            embed=await self.cog.build_panel_embed(draft, panel_name="Ana Panel"),
+            view=self.cog.build_view("main", self.author_id),
+        )
+
+    @discord.ui.button(
+        label="İptal",
+        emoji="✖️",
+        style=discord.ButtonStyle.secondary,
+        row=1,
+    )
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.cog.clear_session(self.author_id)
+
+        for child in self.children:
+            child.disabled = True
+
+        try:
+            await interaction.response.edit_message(
+                content="❎ Yönetim paneli kapatıldı.",
+                embed=None,
+                view=None,
+            )
+        except discord.HTTPException:
+            await interaction.response.send_message("❎ Yönetim paneli kapatıldı.", ephemeral=True)
 
 
 # ============================================================
@@ -954,30 +845,6 @@ class BlacklistMainView(BlacklistBaseView):
 
 
 class Blacklist(commands.Cog):
-    """
-    PAG Blacklist sistemi.
-
-    Özellikler:
-        - !blacklistpanel
-        - !blacklist
-        - !unblacklist
-        - /blacklistpanel
-        - /blacklist
-        - /unblacklist
-        - panel tabanlı akış
-        - hızlı giriş
-        - tek satır giriş
-        - önizleme
-        - yönetim paneli
-        - aktif blacklist join koruması
-
-    Not:
-        Discord join koruması, active blacklist
-        kaydı ve discord_id üzerinden çalışır.
-        Roblox-only kayıtlar da saklanır; Roblox/Discord
-        eşleşmesi geldikçe zenginleştirilir.
-    """
-
     TABLE_NAME = "blacklist"
 
     def __init__(self, bot: commands.Bot) -> None:
@@ -988,11 +855,7 @@ class Blacklist(commands.Cog):
 
         self._lock = asyncio.Lock()
         self._sessions: dict[int, BlacklistSession] = {}
-        self._recent_actions: deque[str] = deque(maxlen=12)
-
-    # ========================================================
-    # COG LOAD
-    # ========================================================
+        self._history: list[str] = []
 
     async def cog_load(self) -> None:
         await self._initialize_database()
@@ -1009,34 +872,39 @@ class Blacklist(commands.Cog):
                 reason TEXT NOT NULL,
                 added_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1
+                active INTEGER NOT NULL DEFAULT 1,
+                announcement_channel_id INTEGER
             )
             """
         )
 
-        await self.database.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_blacklist_active
-            ON blacklist(active)
-            """
+        # migration-safe column add
+        existing = await self.database.fetchall(
+            "PRAGMA table_info(blacklist)",
+            (),
         )
+        columns = {row["name"] for row in existing} if existing else set()
+
+        if "announcement_channel_id" not in columns:
+            try:
+                await self.database.execute(
+                    "ALTER TABLE blacklist ADD COLUMN announcement_channel_id INTEGER"
+                )
+            except Exception:
+                pass
 
         await self.database.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_blacklist_discord
-            ON blacklist(discord_id)
-            """
+            "CREATE INDEX IF NOT EXISTS idx_blacklist_active ON blacklist(active)"
         )
-
         await self.database.execute(
-            """
-            CREATE INDEX IF NOT EXISTS idx_blacklist_roblox
-            ON blacklist(roblox_id)
-            """
+            "CREATE INDEX IF NOT EXISTS idx_blacklist_discord ON blacklist(discord_id)"
+        )
+        await self.database.execute(
+            "CREATE INDEX IF NOT EXISTS idx_blacklist_roblox ON blacklist(roblox_id)"
         )
 
     # ========================================================
-    # SESSION
+    # SESSION HELPERS
     # ========================================================
 
     def has_session(self, author_id: int) -> bool:
@@ -1048,11 +916,15 @@ class Blacklist(commands.Cog):
     def clear_session(self, author_id: int) -> None:
         self._sessions.pop(author_id, None)
 
+    def get_draft(self, author_id: int) -> BlacklistDraft | None:
+        session = self._sessions.get(author_id)
+        return None if session is None else session.draft
+
     def set_session(
         self,
         author_id: int,
-        draft: BlacklistDraft,
         *,
+        draft: BlacklistDraft,
         channel_id: int | None = None,
         message_id: int | None = None,
         current_view: str | None = None,
@@ -1072,14 +944,19 @@ class Blacklist(commands.Cog):
 
         return session
 
-    def get_draft(self, author_id: int) -> BlacklistDraft | None:
-        session = self._sessions.get(author_id)
-        return None if session is None else session.draft
+    def toggle_kick(self, author_id: int) -> BlacklistDraft | None:
+        draft = self.get_draft(author_id)
+        if draft is None:
+            return None
+
+        updated = replace(draft, kick_now=not draft.kick_now)
+        self.set_session(author_id, draft=updated)
+        return updated
 
     def _push_history(self, text: str) -> None:
-        self._recent_actions.appendleft(
-            f"{_now_iso()} • {text}"
-        )
+        self._history.insert(0, f"{_now_iso()} • {text}")
+        if len(self._history) > 20:
+            self._history.pop()
 
     # ========================================================
     # PARSING / VALIDATION
@@ -1088,11 +965,9 @@ class Blacklist(commands.Cog):
     def normalize_reason(self, reason: str | None) -> str:
         if not reason:
             return "Sebep belirtilmedi."
-
         value = reason.strip()
         if not value:
             return "Sebep belirtilmedi."
-
         return value[:MAX_REASON_LENGTH]
 
     def parse_quick_input(self, raw: str) -> BlacklistDraft | None:
@@ -1117,7 +992,6 @@ class Blacklist(commands.Cog):
             elif low.startswith(("reason:", "sebep:", "r:")):
                 reason = self.normalize_reason(part.split(":", 1)[1])
             else:
-                # ilk boş olmayan serbest metni hedef gibi değerlendir
                 if discord_id is None and roblox_username is None:
                     parsed_id = _parse_discord_id(part)
                     if parsed_id is not None:
@@ -1135,27 +1009,14 @@ class Blacklist(commands.Cog):
             kick_now=True,
         )
 
-    def validate_reason(self, reason: str) -> Optional[str]:
-        if not reason.strip():
-            return "Sebep boş bırakılamaz."
-
-        if len(reason) > MAX_REASON_LENGTH:
-            return "Sebep çok uzun."
-
-        return None
-
     def validate_draft(self, draft: BlacklistDraft) -> Optional[str]:
         if not draft.is_ready:
-            return "En az bir hedef belirtmelisin. Discord kullanıcısı veya Roblox kullanıcı adı girebilirsin."
-
-        if draft.discord_id is None and draft.roblox_username is None:
             return "En az bir hedef belirtmelisin."
 
         if draft.roblox_username is not None:
-            username = draft.roblox_username.strip()
-            if len(username) < 3:
+            if len(draft.roblox_username.strip()) < 3:
                 return "Roblox kullanıcı adı çok kısa."
-            if len(username) > 20:
+            if len(draft.roblox_username.strip()) > 20:
                 return "Roblox kullanıcı adı çok uzun."
 
         if draft.reason and len(draft.reason) > MAX_REASON_LENGTH:
@@ -1167,10 +1028,7 @@ class Blacklist(commands.Cog):
     # RESOLUTION
     # ========================================================
 
-    async def resolve_roblox_target(
-        self,
-        username: str,
-    ) -> BlacklistResolvedTarget:
+    async def resolve_roblox_target(self, username: str) -> BlacklistResolvedTarget:
         user = await self.roblox_service.get_user_by_username(username)
 
         avatar_url = None
@@ -1199,9 +1057,7 @@ class Blacklist(commands.Cog):
         if member is None and interaction.guild is not None:
             try:
                 member = await interaction.guild.fetch_member(discord_id)
-            except discord.NotFound:
-                member = None
-            except discord.HTTPException:
+            except Exception:
                 member = None
 
         return BlacklistResolvedTarget(
@@ -1219,27 +1075,26 @@ class Blacklist(commands.Cog):
         discord_id: int | None = None,
         roblox_id: int | None = None,
     ) -> Any | None:
-        conditions: list[str] = []
+        clauses: list[str] = []
         params: list[Any] = []
 
         if discord_id is not None:
-            conditions.append("discord_id = ?")
+            clauses.append("discord_id = ?")
             params.append(discord_id)
 
         if roblox_id is not None:
-            conditions.append("roblox_id = ?")
+            clauses.append("roblox_id = ?")
             params.append(roblox_id)
 
-        if not conditions:
+        if not clauses:
             return None
 
         query = (
             "SELECT * FROM blacklist WHERE ("
-            + " OR ".join(conditions)
+            + " OR ".join(clauses)
             + ") AND active = 1 "
             "ORDER BY id DESC LIMIT 1"
         )
-
         return await self.database.fetchone(query, tuple(params))
 
     async def _find_inactive_record(
@@ -1248,139 +1103,27 @@ class Blacklist(commands.Cog):
         discord_id: int | None = None,
         roblox_id: int | None = None,
     ) -> Any | None:
-        conditions: list[str] = []
+        clauses: list[str] = []
         params: list[Any] = []
 
         if discord_id is not None:
-            conditions.append("discord_id = ?")
+            clauses.append("discord_id = ?")
             params.append(discord_id)
 
         if roblox_id is not None:
-            conditions.append("roblox_id = ?")
+            clauses.append("roblox_id = ?")
             params.append(roblox_id)
 
-        if not conditions:
+        if not clauses:
             return None
 
         query = (
             "SELECT * FROM blacklist WHERE ("
-            + " OR ".join(conditions)
+            + " OR ".join(clauses)
             + ") AND active = 0 "
             "ORDER BY id DESC LIMIT 1"
         )
-
         return await self.database.fetchone(query, tuple(params))
-
-    async def _upsert_record(
-        self,
-        *,
-        target: BlacklistResolvedTarget,
-        reason: str,
-        added_by: int,
-    ) -> tuple[Any | None, str]:
-        """
-        Aktif kayıt varsa günceller, yoksa ekler.
-        """
-        async with self._lock:
-            existing = await self._find_active_record(
-                discord_id=target.discord_id,
-                roblox_id=target.roblox_id,
-            )
-
-            inactive_existing = None
-            if existing is None:
-                inactive_existing = await self._find_inactive_record(
-                    discord_id=target.discord_id,
-                    roblox_id=target.roblox_id,
-                )
-
-            now = _now_iso()
-
-            if existing is not None:
-                await self.database.execute(
-                    """
-                    UPDATE blacklist
-                    SET
-                        discord_id = ?,
-                        roblox_id = ?,
-                        roblox_username = ?,
-                        reason = ?,
-                        added_by = ?,
-                        created_at = ?,
-                        active = 1
-                    WHERE id = ?
-                    """,
-                    (
-                        target.discord_id,
-                        target.roblox_id,
-                        target.roblox_username,
-                        reason,
-                        added_by,
-                        now,
-                        existing["id"],
-                    ),
-                )
-                return existing, "updated"
-
-            if inactive_existing is not None:
-                await self.database.execute(
-                    """
-                    UPDATE blacklist
-                    SET
-                        discord_id = ?,
-                        roblox_id = ?,
-                        roblox_username = ?,
-                        reason = ?,
-                        added_by = ?,
-                        created_at = ?,
-                        active = 1
-                    WHERE id = ?
-                    """,
-                    (
-                        target.discord_id,
-                        target.roblox_id,
-                        target.roblox_username,
-                        reason,
-                        added_by,
-                        now,
-                        inactive_existing["id"],
-                    ),
-                )
-                return inactive_existing, "reactivated"
-
-            await self.database.execute(
-                """
-                INSERT INTO blacklist (
-                    discord_id,
-                    roblox_id,
-                    roblox_username,
-                    reason,
-                    added_by,
-                    created_at,
-                    active
-                )
-                VALUES (?, ?, ?, ?, ?, ?, 1)
-                """,
-                (
-                    target.discord_id,
-                    target.roblox_id,
-                    target.roblox_username,
-                    reason,
-                    added_by,
-                    now,
-                ),
-            )
-            return None, "inserted"
-
-    async def _deactivate_record(self, record: Any) -> None:
-        await self.database.execute(
-            """
-            UPDATE blacklist
-            SET active = 0
-            WHERE id = ?
-            """,
-            (record["id"],),
-        )
 
     async def _count_active(self) -> int:
         row = await self.database.fetchone(
@@ -1395,6 +1138,116 @@ class Blacklist(commands.Cog):
             (),
         )
 
+    async def _upsert_record(
+        self,
+        *,
+        target: BlacklistResolvedTarget,
+        reason: str,
+        added_by: int,
+        announcement_channel_id: int | None,
+    ) -> tuple[Any | None, str]:
+        async with self._lock:
+            active_record = await self._find_active_record(
+                discord_id=target.discord_id,
+                roblox_id=target.roblox_id,
+            )
+            inactive_record = None
+            if active_record is None:
+                inactive_record = await self._find_inactive_record(
+                    discord_id=target.discord_id,
+                    roblox_id=target.roblox_id,
+                )
+
+            now = _now_iso()
+
+            if active_record is not None:
+                await self.database.execute(
+                    """
+                    UPDATE blacklist
+                    SET
+                        discord_id = ?,
+                        roblox_id = ?,
+                        roblox_username = ?,
+                        reason = ?,
+                        added_by = ?,
+                        created_at = ?,
+                        active = 1,
+                        announcement_channel_id = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        target.discord_id,
+                        target.roblox_id,
+                        target.roblox_username,
+                        reason,
+                        added_by,
+                        now,
+                        announcement_channel_id,
+                        active_record["id"],
+                    ),
+                )
+                return active_record, "updated"
+
+            if inactive_record is not None:
+                await self.database.execute(
+                    """
+                    UPDATE blacklist
+                    SET
+                        discord_id = ?,
+                        roblox_id = ?,
+                        roblox_username = ?,
+                        reason = ?,
+                        added_by = ?,
+                        created_at = ?,
+                        active = 1,
+                        announcement_channel_id = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        target.discord_id,
+                        target.roblox_id,
+                        target.roblox_username,
+                        reason,
+                        added_by,
+                        now,
+                        announcement_channel_id,
+                        inactive_record["id"],
+                    ),
+                )
+                return inactive_record, "reactivated"
+
+            await self.database.execute(
+                """
+                INSERT INTO blacklist (
+                    discord_id,
+                    roblox_id,
+                    roblox_username,
+                    reason,
+                    added_by,
+                    created_at,
+                    active,
+                    announcement_channel_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    target.discord_id,
+                    target.roblox_id,
+                    target.roblox_username,
+                    reason,
+                    added_by,
+                    now,
+                    announcement_channel_id,
+                ),
+            )
+            return None, "inserted"
+
+    async def _deactivate_record(self, record: Any) -> None:
+        await self.database.execute(
+            "UPDATE blacklist SET active = 0 WHERE id = ?",
+            (record["id"],),
+        )
+
     # ========================================================
     # EMBEDS
     # ========================================================
@@ -1405,77 +1258,74 @@ class Blacklist(commands.Cog):
         *,
         panel_name: str,
     ) -> discord.Embed:
-        count = await self._count_active()
+        active_count = await self._count_active()
 
         embed = discord.Embed(
             title="🚫 PAG BLACKLIST PANEL",
             description=(
                 "Buradan blacklist ekleyebilir, düzenleyebilir, önizleyebilir ve kaldırabilirsin.\n\n"
-                "Discord hedefi veya Roblox hedefi seç.\n"
-                "İstersen tek satır hızlı giriş kullan.\n"
-                "Göndermeden önce önizleme aç."
+                "İşlem yapılan kanal, duyuru kanalı olarak da kullanılır."
             ),
             color=discord.Color.dark_red() if draft.is_ready else discord.Color.blurple(),
             timestamp=discord.utils.utcnow(),
         )
 
+        embed.add_field(name="Panel", value=panel_name, inline=True)
+        embed.add_field(name="Durum", value="Hazır" if draft.is_ready else "Eksik", inline=True)
+        embed.add_field(name="Aktif Kayıt", value=f"`{active_count}`", inline=True)
+
         embed.add_field(
-            name="Panel",
-            value=panel_name,
+            name="Discord Hedef",
+            value=(
+                f"<@{draft.discord_id}>"
+                if draft.discord_id is not None
+                else "—"
+            ),
             inline=True,
         )
         embed.add_field(
-            name="Durum",
-            value="Hazır" if draft.is_ready else "Eksik",
-            inline=True,
-        )
-        embed.add_field(
-            name="Aktif Kayıt",
-            value=f"`{count}`",
-            inline=True,
-        )
-        embed.add_field(
-            name="Discord",
-            value=_truncate(draft.discord_label or ("<@" + str(draft.discord_id) + ">" if draft.discord_id else "—"), 256),
-            inline=True,
-        )
-        embed.add_field(
-            name="Roblox",
-            value=_truncate(draft.roblox_username or "—", 256),
+            name="Roblox Hedef",
+            value=_truncate(draft.roblox_username, 128),
             inline=True,
         )
         embed.add_field(
             name="Sebep",
-            value=_truncate(draft.reason or "Sebep belirtilmedi.", MAX_PANEL_NOTE_LENGTH),
+            value=_truncate(draft.reason, 1024),
             inline=False,
         )
+
         embed.add_field(
             name="Kick",
             value="Açık" if draft.kick_now else "Kapalı",
             inline=True,
         )
         embed.add_field(
+            name="Duyuru Kanalı",
+            value=(
+                f"<#{draft.announcement_channel_id}>"
+                if draft.announcement_channel_id is not None
+                else "Bu kanal"
+            ),
+            inline=True,
+        )
+
+        embed.add_field(
             name="Hızlı Format",
             value="`discord:@user | roblox:Username | reason:sebep`",
             inline=False,
         )
 
-        embed.set_footer(
-            text="Panel • Butonlar ile hedef ekle, önizle ve gönder.",
-        )
-
         if draft.avatar_url:
             embed.set_thumbnail(url=draft.avatar_url)
 
+        embed.set_footer(
+            text="Panel • Butonlar ile hedef ekle, önizle ve gönder.",
+        )
         return embed
 
     async def build_preview_embed(self, draft: BlacklistDraft) -> discord.Embed:
-        title = "🚫 BLACKLIST ÖNİZLEME"
-        if draft.roblox_display_name:
-            title = f"🚫 {draft.roblox_display_name}"
-
         embed = discord.Embed(
-            title=title,
+            title="🚫 BLACKLIST ÖNİZLEME",
             description="Blacklist işlemi gönderilmeden önce son kontrol.",
             color=discord.Color.red(),
             timestamp=discord.utils.utcnow(),
@@ -1492,40 +1342,35 @@ class Blacklist(commands.Cog):
             embed.add_field(
                 name="Roblox",
                 value=(
-                    f"**{_truncate(draft.roblox_username, 50)}**"
+                    f"**{_truncate(draft.roblox_username, 64)}**"
                     + (f"\n`{draft.roblox_id}`" if draft.roblox_id else "")
                 ),
                 inline=True,
             )
 
-        embed.add_field(
-            name="Sebep",
-            value=_truncate(draft.reason, 1024),
-            inline=False,
-        )
-
+        embed.add_field(name="Sebep", value=_truncate(draft.reason, 1024), inline=False)
         embed.add_field(
             name="Kick",
             value="Açık" if draft.kick_now else "Kapalı",
             inline=True,
         )
-
-        embed.set_footer(
-            text="Göndermeden önce doğrula.",
+        embed.add_field(
+            name="Duyuru Kanalı",
+            value=(
+                f"<#{draft.announcement_channel_id}>"
+                if draft.announcement_channel_id is not None
+                else "Bu kanal"
+            ),
+            inline=True,
         )
 
         if draft.avatar_url:
             embed.set_thumbnail(url=draft.avatar_url)
 
+        embed.set_footer(text="Göndermeden önce doğrula.")
         return embed
 
-    async def build_status_embed(
-        self,
-        draft: BlacklistDraft,
-        *,
-        moderator: discord.Member | discord.User,
-    ) -> discord.Embed:
-        count = await self._count_active()
+    async def build_manage_embed(self, draft: BlacklistDraft) -> discord.Embed:
         latest = await self._latest_action_record()
 
         embed = discord.Embed(
@@ -1535,23 +1380,21 @@ class Blacklist(commands.Cog):
             timestamp=discord.utils.utcnow(),
         )
 
-        embed.add_field(
-            name="Aktif Kayıt",
-            value=f"`{count}`",
-            inline=True,
-        )
+        active_count = await self._count_active()
+
+        embed.add_field(name="Aktif Kayıt", value=f"`{active_count}`", inline=True)
         embed.add_field(
             name="Son İşlem",
-            value=(
-                f"`#{latest['id']}`"
-                if latest is not None
-                else "—"
-            ),
+            value=f"`#{latest['id']}`" if latest is not None else "—",
             inline=True,
         )
         embed.add_field(
-            name="Moderator",
-            value=moderator.mention if isinstance(moderator, discord.Member) else str(moderator),
+            name="Duyuru Kanalı",
+            value=(
+                f"<#{draft.announcement_channel_id}>"
+                if draft.announcement_channel_id is not None
+                else "Bu kanal"
+            ),
             inline=True,
         )
 
@@ -1566,33 +1409,33 @@ class Blacklist(commands.Cog):
         )
         embed.add_field(
             name="Roblox Hedef",
-            value=_truncate(draft.roblox_username or "—", 256),
+            value=_truncate(draft.roblox_username, 128),
             inline=True,
         )
         embed.add_field(
             name="Sebep",
-            value=_truncate(draft.reason or "Sebep belirtilmedi.", 1024),
+            value=_truncate(draft.reason, 1024),
             inline=False,
         )
 
-        if latest is not None:
-            embed.add_field(
-                name="Son Kayıt",
-                value=(
-                    f"Discord: {latest['discord_id'] or '—'}\n"
-                    f"Roblox: {latest['roblox_username'] or '—'}\n"
-                    f"Durum: {'Aktif' if latest['active'] else 'Pasif'}"
-                ),
-                inline=False,
-            )
+        embed.set_footer(text="Yönetim • Kaldır, geçmiş, duyuru kanalını seç, geri dön.")
+        return embed
 
-        embed.set_footer(
-            text="Durum • Kaldır, önizle, geri dön.",
+    async def build_history_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="📜 BLACKLIST GEÇMİŞİ",
+            description="Son işlemler.",
+            color=discord.Color.blurple(),
+            timestamp=discord.utils.utcnow(),
         )
 
-        if draft.avatar_url:
-            embed.set_thumbnail(url=draft.avatar_url)
+        if not self._history:
+            embed.description = "Henüz geçmiş yok."
+            return embed
 
+        embed.description = "\n\n".join(
+            _truncate(item, 900) for item in self._history[:10]
+        )
         return embed
 
     def build_view(self, kind: str, author_id: int) -> BlacklistBaseView:
@@ -1603,7 +1446,7 @@ class Blacklist(commands.Cog):
         return BlacklistMainView(self, author_id)
 
     # ========================================================
-    # PANEL REFRESH
+    # REFRESH PANEL
     # ========================================================
 
     async def refresh_panel_message(
@@ -1616,51 +1459,66 @@ class Blacklist(commands.Cog):
         if session is None:
             return
 
-        draft = session.draft
-        channel_id = session.panel_channel_id
-        message_id = session.panel_message_id
-
-        if channel_id is None or message_id is None:
+        if session.panel_channel_id is None or session.panel_message_id is None:
             return
 
-        channel = self.bot.get_channel(channel_id)
-        if channel is None and self.bot.guilds:
+        channel = self.bot.get_channel(session.panel_channel_id)
+        if channel is None:
             try:
-                channel = await self.bot.fetch_channel(channel_id)
+                channel = await self.bot.fetch_channel(session.panel_channel_id)
             except Exception:
-                channel = None
+                return
 
-        if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+        if not hasattr(channel, "fetch_message"):
             return
 
         try:
-            message = await channel.fetch_message(message_id)
+            message = await channel.fetch_message(session.panel_message_id)
         except Exception:
             return
 
         try:
-            await message.edit(
-                embed=await self.build_panel_embed(
-                    draft,
-                    panel_name={
-                        "main": "Ana Panel",
-                        "detail": "Ayrıntılı Panel",
-                        "preview": "Önizleme",
-                        "manage": "Yönetim Paneli",
-                        "history": "Geçmiş",
-                    }.get(session.current_view, "Ana Panel"),
-                ),
-                view=self.build_view(session.current_view, author_id),
+            embed = await self.build_panel_embed(
+                session.draft,
+                panel_name={
+                    "main": "Ana Panel",
+                    "preview": "Önizleme",
+                    "manage": "Yönetim Paneli",
+                }.get(session.current_view, "Ana Panel"),
             )
+            view = self.build_view(session.current_view, author_id)
+            await message.edit(embed=embed, view=view)
         except Exception:
             pass
 
         if notice:
-            # Ephemeral olmadan paneli kullanan admin için kısa geri bildirim.
             try:
-                await channel.send(notice, delete_after=6)
+                await message.channel.send(notice, delete_after=6)
             except Exception:
                 pass
+
+    # ========================================================
+    # PUBLIC ANNOUNCEMENT
+    # ========================================================
+
+    async def send_public_embed(self, channel_id: int | None, embed: discord.Embed) -> None:
+        if channel_id is None:
+            return
+
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception:
+                return
+
+        if not hasattr(channel, "send"):
+            return
+
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            self.logger.exception("Failed to send public blacklist announcement.")
 
     # ========================================================
     # BLACKLIST CORE
@@ -1671,33 +1529,20 @@ class Blacklist(commands.Cog):
         *,
         moderator: discord.Member | discord.User,
         kick_now: bool = True,
-    ) -> "BlacklistOperation":
-        """
-        Mevcut session'daki veriyi blacklist'e yazar.
-
-        Discord target varsa:
-            - kayıt yazılır
-            - guild içindeyse kick edilir
-
-        Roblox target varsa:
-            - kayıt yazılır
-            - avatar / isim bilgisi saklanır
-        """
-
-        if not isinstance(moderator, (discord.Member, discord.User)):
-            raise TypeError("Moderator must be a Discord user object.")
-
+        announce_channel_id: int | None = None,
+    ) -> BlacklistOperation:
         session = self.get_session(moderator.id)
         if session is None:
             raise RuntimeError("Blacklist session not found.")
 
         draft = session.draft
-        if not draft.is_ready:
-            raise ValueError("Blacklist draft is not ready.")
+        error = self.validate_draft(draft)
+        if error:
+            raise ValueError(error)
 
-        validation_error = self.validate_draft(draft)
-        if validation_error:
-            raise ValueError(validation_error)
+        # Eğer announcement channel verilmemişse mevcut panel kanalını kullan.
+        if announce_channel_id is None:
+            announce_channel_id = session.panel_channel_id
 
         target = BlacklistResolvedTarget(
             discord_id=draft.discord_id,
@@ -1707,15 +1552,16 @@ class Blacklist(commands.Cog):
             avatar_url=draft.avatar_url,
         )
 
-        # Roblox hedefi varsa tekrar çözümleyip güvence altına al.
+        # Roblox hedefi varsa güvenli şekilde çöz.
         if target.roblox_username and target.roblox_id is None:
-            roblox_target = await self.resolve_roblox_target(target.roblox_username)
-            target.roblox_id = roblox_target.roblox_id
-            target.roblox_display_name = roblox_target.roblox_display_name
-            target.avatar_url = roblox_target.avatar_url
-            target.roblox_username = roblox_target.roblox_username
+            resolved = await self.resolve_roblox_target(target.roblox_username)
+            target.roblox_id = resolved.roblox_id
+            target.roblox_username = resolved.roblox_username
+            target.roblox_display_name = resolved.roblox_display_name
+            target.avatar_url = resolved.avatar_url
 
-        if target.discord_id is not None and target.discord_member is None:
+        # Discord member çöz.
+        if target.discord_id is not None:
             if moderator.guild is not None:
                 member = moderator.guild.get_member(target.discord_id)
                 if member is None:
@@ -1725,42 +1571,39 @@ class Blacklist(commands.Cog):
                         member = None
                 target.discord_member = member
 
-        record, action = await self._upsert_record(
+        _, action = await self._upsert_record(
             target=target,
             reason=draft.reason,
             added_by=moderator.id,
+            announcement_channel_id=announce_channel_id,
         )
 
         kicked = False
-        kick_error: str | None = None
+        kick_error = None
 
         if kick_now and target.discord_member is not None:
             try:
                 await target.discord_member.kick(
-                    reason=(
-                        f"Blacklist: {draft.reason[:450]}"
-                    )
+                    reason=f"Blacklist: {draft.reason[:450]}",
                 )
                 kicked = True
             except discord.Forbidden:
-                kick_error = "Botun bu üyeyi atmaya yetkisi yok."
+                kick_error = "Kick yetkisi yok."
             except discord.HTTPException:
-                kick_error = "Kick işlemi sırasında Discord API hatası oluştu."
+                kick_error = "Discord API hatası."
             except Exception:
-                kick_error = "Kick işlemi sırasında beklenmeyen bir hata oluştu."
+                kick_error = "Beklenmeyen kick hatası."
 
         self._push_history(
-            f"{'GÜNCELLENDİ' if action != 'inserted' else 'EKLENDİ'} • "
-            f"Discord={target.discord_id or '—'} • Roblox={target.roblox_username or '—'} • "
-            f"Moderator={moderator.id}"
+            f"{'GÜNCELLENDİ' if action != 'inserted' else 'EKLENDİ'} • Discord={target.discord_id or '—'} • Roblox={target.roblox_username or '—'} • Moderator={moderator.id}"
         )
 
         embed = discord.Embed(
             title="🚫 BLACKLIST",
             description=(
-                "Hedef blacklist'e eklendi."
+                "Blacklist kaydı işlendi ve duyuru yapıldı."
                 if action == "inserted"
-                else "Hedef blacklist kaydı güncellendi."
+                else "Blacklist kaydı güncellendi ve duyuru yapıldı."
             ),
             color=discord.Color.red(),
             timestamp=discord.utils.utcnow(),
@@ -1778,7 +1621,7 @@ class Blacklist(commands.Cog):
                 name="Roblox",
                 value=(
                     f"**{target.roblox_display_name or target.roblox_username}**\n"
-                    f"`{target.roblox_id}`"
+                    f"`{target.roblox_id or '—'}`"
                 ),
                 inline=True,
             )
@@ -1796,41 +1639,52 @@ class Blacklist(commands.Cog):
         )
 
         if kick_error:
-            embed.add_field(
-                name="Kick Notu",
-                value=_truncate(kick_error, 1024),
-                inline=False,
-            )
+            embed.add_field(name="Kick Notu", value=kick_error, inline=False)
 
         if target.avatar_url:
             embed.set_thumbnail(url=target.avatar_url)
 
-        return type(
-            "BlacklistOperation",
-            (),
-            {
-                "result": "success",
-                "target": target,
-                "record": record,
-                "message": "✅ Blacklist tamamlandı."
-                + (" Hedef sunucudan atıldı." if kicked else "")
-                + (f" ({kick_error})" if kick_error else ""),
-                "embed": embed,
-            },
-        )()
+        # Duyuru bu kayıt için saklansın.
+        if announce_channel_id is not None:
+            await self.database.execute(
+                """
+                UPDATE blacklist
+                SET announcement_channel_id = ?
+                WHERE active = 1 AND (
+                    (discord_id IS NOT NULL AND discord_id = ?)
+                    OR (roblox_id IS NOT NULL AND roblox_id = ?)
+                )
+                """,
+                (
+                    announce_channel_id,
+                    target.discord_id,
+                    target.roblox_id,
+                ),
+            )
+
+        return BlacklistOperation(
+            success=True,
+            message="✅ Blacklist tamamlandı."
+            + (" Hedef sunucudan atıldı." if kicked else "")
+            + (f" ({kick_error})" if kick_error else ""),
+            embed=embed,
+            kicked=kicked,
+            kick_error=kick_error,
+        )
 
     async def remove_by_text(
         self,
         *,
         moderator: discord.Member | discord.User,
         target_text: str,
-    ) -> "BlacklistOperation":
-        """
-        Discord ID / Roblox username ile kayıt kaldırır.
-        """
+        announce_channel_id: int | None = None,
+    ) -> BlacklistOperation:
         target_text = target_text.strip()
         if not target_text:
-            raise ValueError("Hedef boş olamaz.")
+            return BlacklistOperation(
+                success=False,
+                message="❌ Hedef boş olamaz.",
+            )
 
         discord_id = _parse_discord_id(target_text)
         roblox_username = None if discord_id is not None else _parse_roblox_username_hint(target_text)
@@ -1839,11 +1693,9 @@ class Blacklist(commands.Cog):
         if discord_id is not None:
             record = await self._find_active_record(discord_id=discord_id)
         elif roblox_username is not None:
-            # Roblox username ile aktif kayıt araması.
             record = await self.database.fetchone(
                 """
-                SELECT *
-                FROM blacklist
+                SELECT * FROM blacklist
                 WHERE roblox_username = ? AND active = 1
                 ORDER BY id DESC
                 LIMIT 1
@@ -1852,15 +1704,10 @@ class Blacklist(commands.Cog):
             )
 
         if record is None:
-            return type(
-                "BlacklistOperation",
-                (),
-                {
-                    "result": "not_found",
-                    "record": None,
-                    "message": "❌ Kaldırılacak aktif blacklist kaydı bulunamadı.",
-                },
-            )()
+            return BlacklistOperation(
+                success=False,
+                message="❌ Kaldırılacak aktif blacklist kaydı bulunamadı.",
+            )
 
         await self._deactivate_record(record)
 
@@ -1900,19 +1747,17 @@ class Blacklist(commands.Cog):
             inline=True,
         )
 
-        return type(
-            "BlacklistOperation",
-            (),
-            {
-                "result": "success",
-                "record": record,
-                "message": "✅ Kayıt kaldırıldı.",
-                "embed": embed,
-            },
-        )()
+        if announce_channel_id is not None:
+            embed.set_footer(text=f"İşlem kanalı: #{announce_channel_id}")
+
+        return BlacklistOperation(
+            success=True,
+            message="✅ Kayıt kaldırıldı.",
+            embed=embed,
+        )
 
     # ========================================================
-    # COMMANDS: PANEL
+    # PANEL COMMAND
     # ========================================================
 
     @app_commands.command(
@@ -1923,28 +1768,24 @@ class Blacklist(commands.Cog):
     @app_commands.default_permissions(administrator=True)
     async def blacklistpanel(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Bu komut yalnızca sunucularda kullanılabilir.",
-            )
+            await self.safe_initial_response(interaction, "❌ Bu komut yalnızca sunucularda kullanılabilir.")
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Sunucu üye bilgisi alınamadı.",
-            )
+            await self.safe_initial_response(interaction, "❌ Sunucu üye bilgisi alınamadı.")
             return
 
         if not interaction.user.guild_permissions.administrator:
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Bu komutu yalnızca Administrator kullanabilir.",
-            )
+            await self.safe_initial_response(interaction, "❌ Bu komutu yalnızca Administrator kullanabilir.")
             return
 
-        draft = BlacklistDraft()
-        self.set_session(interaction.user.id, draft=draft)
+        draft = BlacklistDraft(announcement_channel_id=interaction.channel_id)
+        self.set_session(
+            interaction.user.id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="main",
+        )
 
         embed = await self.build_panel_embed(draft, panel_name="Ana Panel")
         view = self.build_view("main", interaction.user.id)
@@ -1956,12 +1797,11 @@ class Blacklist(commands.Cog):
         )
 
         try:
+            message = await interaction.original_response()
             session = self.get_session(interaction.user.id)
             if session is not None:
-                session.panel_channel_id = interaction.channel_id
-                session.panel_message_id = interaction.original_response().id if False else None
+                session.panel_message_id = message.id
         except Exception:
-            # original_response() burada kullanılmayabilir; panel yine çalışır.
             pass
 
     @commands.command(name="blacklistpanel")
@@ -1973,14 +1813,22 @@ class Blacklist(commands.Cog):
         *,
         raw: str | None = None,
     ) -> None:
-        draft = BlacklistDraft()
+        draft = BlacklistDraft(announcement_channel_id=ctx.channel.id)
 
         if raw and raw.strip():
             parsed = self.parse_quick_input(raw)
             if parsed is not None:
-                draft = parsed
+                draft = replace(
+                    parsed,
+                    announcement_channel_id=ctx.channel.id,
+                )
 
-        self.set_session(ctx.author.id, draft=draft)
+        self.set_session(
+            ctx.author.id,
+            draft=draft,
+            channel_id=ctx.channel.id,
+            current_view="main",
+        )
 
         embed = await self.build_panel_embed(draft, panel_name="Ana Panel")
         view = self.build_view("main", ctx.author.id)
@@ -1989,25 +1837,23 @@ class Blacklist(commands.Cog):
 
         session = self.get_session(ctx.author.id)
         if session is not None:
-            session.panel_channel_id = sent.channel.id
             session.panel_message_id = sent.id
-            session.current_view = "main"
 
     # ========================================================
-    # COMMANDS: BLACKLIST
+    # DIRECT BLACKLIST
     # ========================================================
 
     @app_commands.command(
         name="blacklist",
         description="Bir kullanıcıyı blacklist'e ekler.",
     )
+    @app_commands.guild_only()
+    @app_commands.default_permissions(administrator=True)
     @app_commands.describe(
-        member="Discord kullanıcısı.",
+        member="Discord üyesi.",
         roblox_username="Roblox kullanıcı adı.",
         reason="Blacklist sebebi.",
     )
-    @app_commands.guild_only()
-    @app_commands.default_permissions(administrator=True)
     async def blacklist(
         self,
         interaction: discord.Interaction,
@@ -2016,29 +1862,15 @@ class Blacklist(commands.Cog):
         reason: str = "Sebep belirtilmedi.",
     ) -> None:
         if interaction.guild is None:
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Bu komut yalnızca sunucularda kullanılabilir.",
-            )
+            await self.safe_initial_response(interaction, "❌ Bu komut yalnızca sunucularda kullanılabilir.")
             return
 
         if not isinstance(interaction.user, discord.Member):
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Sunucu üye bilgisi alınamadı.",
-            )
+            await self.safe_initial_response(interaction, "❌ Sunucu üye bilgisi alınamadı.")
             return
 
         if not interaction.user.guild_permissions.administrator:
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Bu komutu yalnızca Administrator kullanabilir.",
-            )
-            return
-
-        if member is None and not roblox_username:
-            # Panel aç.
-            await self.blacklistpanel(interaction)
+            await self.safe_initial_response(interaction, "❌ Bu komutu yalnızca Administrator kullanabilir.")
             return
 
         draft = BlacklistDraft(
@@ -2047,50 +1879,60 @@ class Blacklist(commands.Cog):
             roblox_username=_parse_roblox_username_hint(roblox_username or "") if roblox_username else None,
             reason=self.normalize_reason(reason),
             kick_now=True,
+            announcement_channel_id=interaction.channel_id,
         )
 
         if draft.roblox_username:
             try:
-                target = await self.resolve_roblox_target(draft.roblox_username)
+                resolved = await self.resolve_roblox_target(draft.roblox_username)
                 draft = replace(
                     draft,
-                    roblox_id=target.roblox_id,
-                    roblox_display_name=target.roblox_display_name,
-                    avatar_url=target.avatar_url,
-                    roblox_username=target.roblox_username,
+                    roblox_id=resolved.roblox_id,
+                    roblox_username=resolved.roblox_username,
+                    roblox_display_name=resolved.roblox_display_name,
+                    avatar_url=resolved.avatar_url,
                 )
             except RobloxNotFoundError:
-                await self.safe_initial_response(
-                    interaction,
-                    content="❌ Roblox kullanıcısı bulunamadı.",
-                )
+                await self.safe_initial_response(interaction, "❌ Roblox kullanıcısı bulunamadı.")
                 return
             except RobloxAPIError:
-                await self.safe_initial_response(
-                    interaction,
-                    content="❌ Roblox API hatası oluştu.",
-                )
+                await self.safe_initial_response(interaction, "❌ Roblox API hatası oluştu.")
                 return
             except Exception:
                 self.logger.exception("Unexpected Roblox resolution error.")
                 await self.safe_initial_response(
                     interaction,
-                    content="❌ Roblox hedefi çözümlenirken beklenmeyen bir hata oluştu.",
+                    "❌ Roblox hedefi çözümlenirken beklenmeyen bir hata oluştu.",
                 )
                 return
 
-        self.set_session(interaction.user.id, draft=draft)
-        result = await self.execute_blacklist(
-            moderator=interaction.user,
-            kick_now=True,
+        self.set_session(
+            interaction.user.id,
+            draft=draft,
+            channel_id=interaction.channel_id,
+            current_view="main",
         )
+
+        try:
+            result = await self.execute_blacklist(
+                moderator=interaction.user,
+                kick_now=True,
+                announce_channel_id=interaction.channel_id,
+            )
+        except Exception:
+            self.logger.exception("Blacklist execution failed.")
+            await self.safe_initial_response(interaction, "❌ Blacklist işlemi sırasında beklenmeyen bir hata oluştu.")
+            return
+        finally:
+            self.clear_session(interaction.user.id)
+
+        if result.embed is not None:
+            await self.send_public_embed(interaction.channel_id, result.embed)
 
         await self.safe_initial_response(
             interaction,
-            content=result.message or "✅ Blacklist tamamlandı.",
+            result.message,
         )
-        # İstersen panel de açık kalsın; burada temizliyoruz.
-        self.clear_session(interaction.user.id)
 
     @commands.command(name="blacklist")
     @commands.guild_only()
@@ -2115,17 +1957,18 @@ class Blacklist(commands.Cog):
             roblox_username=roblox_username,
             reason=self.normalize_reason(reason),
             kick_now=True,
+            announcement_channel_id=ctx.channel.id,
         )
 
         if draft.roblox_username:
             try:
-                target_resolved = await self.resolve_roblox_target(draft.roblox_username)
+                resolved = await self.resolve_roblox_target(draft.roblox_username)
                 draft = replace(
                     draft,
-                    roblox_id=target_resolved.roblox_id,
-                    roblox_display_name=target_resolved.roblox_display_name,
-                    avatar_url=target_resolved.avatar_url,
-                    roblox_username=target_resolved.roblox_username,
+                    roblox_id=resolved.roblox_id,
+                    roblox_username=resolved.roblox_username,
+                    roblox_display_name=resolved.roblox_display_name,
+                    avatar_url=resolved.avatar_url,
                 )
             except RobloxNotFoundError:
                 await ctx.send("❌ Roblox kullanıcısı bulunamadı.")
@@ -2138,12 +1981,18 @@ class Blacklist(commands.Cog):
                 await ctx.send("❌ Roblox hedefi çözümlenirken beklenmeyen bir hata oluştu.")
                 return
 
-        self.set_session(ctx.author.id, draft=draft)
+        self.set_session(
+            ctx.author.id,
+            draft=draft,
+            channel_id=ctx.channel.id,
+            current_view="main",
+        )
 
         try:
             result = await self.execute_blacklist(
                 moderator=ctx.author,
                 kick_now=True,
+                announce_channel_id=ctx.channel.id,
             )
         except Exception:
             self.logger.exception("Blacklist prefix execution failed.")
@@ -2152,25 +2001,18 @@ class Blacklist(commands.Cog):
         finally:
             self.clear_session(ctx.author.id)
 
-        await ctx.send(
-            result.message or "✅ Blacklist tamamlandı.",
-        )
-        if hasattr(result, "embed"):
-            try:
-                await ctx.send(embed=result.embed)
-            except Exception:
-                pass
+        if result.embed is not None:
+            await self.send_public_embed(ctx.channel.id, result.embed)
+
+        await ctx.send(result.message)
 
     # ========================================================
-    # COMMANDS: UNBLACKLIST
+    # UNBLACKLIST
     # ========================================================
 
     @app_commands.command(
         name="unblacklist",
         description="Aktif blacklist kaydını kaldırır.",
-    )
-    @app_commands.describe(
-        target="Discord ID / Mention / Roblox username.",
     )
     @app_commands.guild_only()
     @app_commands.default_permissions(administrator=True)
@@ -2180,20 +2022,21 @@ class Blacklist(commands.Cog):
         target: str | None = None,
     ) -> None:
         if target is None:
-            await self.safe_initial_response(
-                interaction,
-                content="❌ Hedef belirtmelisin.",
-            )
+            await self.safe_initial_response(interaction, "❌ Hedef belirtmelisin.")
             return
 
         result = await self.remove_by_text(
             moderator=interaction.user,
             target_text=target,
+            announce_channel_id=interaction.channel_id,
         )
+
+        if result.embed is not None:
+            await self.send_public_embed(interaction.channel_id, result.embed)
 
         await self.safe_initial_response(
             interaction,
-            content=result.message or "✅ Kayıt kaldırıldı.",
+            result.message,
         )
 
     @commands.command(name="unblacklist")
@@ -2211,8 +2054,13 @@ class Blacklist(commands.Cog):
         result = await self.remove_by_text(
             moderator=ctx.author,
             target_text=target,
+            announce_channel_id=ctx.channel.id,
         )
-        await ctx.send(result.message or "✅ Kayıt kaldırıldı.")
+
+        if result.embed is not None:
+            await self.send_public_embed(ctx.channel.id, result.embed)
+
+        await ctx.send(result.message)
 
     # ========================================================
     # MEMBER JOIN ENFORCEMENT
@@ -2220,31 +2068,43 @@ class Blacklist(commands.Cog):
 
     @commands.Cog.listener()
     async def on_member_join(self, member: discord.Member) -> None:
-        """
-        Discord tarafı soft-ban / rejoin engeli.
-
-        Discord ID kayıtlı aktif blacklist varsa:
-            - üye anında kick edilir
-            - bu, ban gibi davranır ama ban değildir
-        """
         try:
             record = await self._find_active_record(discord_id=member.id)
             if record is None:
                 return
 
             reason = f"Blacklist: {str(record['reason'])[:450]}"
-
             await member.kick(reason=reason)
 
             self._push_history(
                 f"JOIN KICK • Discord={member.id} • Reason={str(record['reason'])[:80]}"
             )
 
-            self.logger.info(
-                "Blacklisted member kicked on join: %s (%s)",
-                member.id,
-                member.guild.id,
+            notice_embed = discord.Embed(
+                title="🚫 BLACKLIST • OTO KICK",
+                description=(
+                    f"{member.mention} blacklist listesinde olduğu için sunucudan çıkarıldı."
+                ),
+                color=discord.Color.red(),
+                timestamp=discord.utils.utcnow(),
             )
+            notice_embed.add_field(
+                name="Sebep",
+                value=_truncate(str(record["reason"]), 1024),
+                inline=False,
+            )
+            notice_embed.add_field(
+                name="Kanal",
+                value=(
+                    f"<#{record['announcement_channel_id']}>"
+                    if record.get("announcement_channel_id")
+                    else "—"
+                ),
+                inline=True,
+            )
+
+            if record.get("announcement_channel_id"):
+                await self.send_public_embed(int(record["announcement_channel_id"]), notice_embed)
 
         except discord.Forbidden:
             self.logger.warning(
@@ -2263,7 +2123,95 @@ class Blacklist(commands.Cog):
             )
 
     # ========================================================
-    # BUILD DRAFT UPDATE HELPERS
+    # REMOVE BY TEXT
+    # ========================================================
+
+    async def remove_by_text(
+        self,
+        *,
+        moderator: discord.Member | discord.User,
+        target_text: str,
+        announce_channel_id: int | None = None,
+    ) -> BlacklistOperation:
+        target_text = target_text.strip()
+        if not target_text:
+            return BlacklistOperation(
+                success=False,
+                message="❌ Hedef boş olamaz.",
+            )
+
+        discord_id = _parse_discord_id(target_text)
+        roblox_username = None if discord_id is not None else _parse_roblox_username_hint(target_text)
+
+        record = None
+        if discord_id is not None:
+            record = await self._find_active_record(discord_id=discord_id)
+        elif roblox_username is not None:
+            record = await self.database.fetchone(
+                """
+                SELECT * FROM blacklist
+                WHERE roblox_username = ? AND active = 1
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (roblox_username,),
+            )
+
+        if record is None:
+            return BlacklistOperation(
+                success=False,
+                message="❌ Kaldırılacak aktif blacklist kaydı bulunamadı.",
+            )
+
+        await self._deactivate_record(record)
+
+        self._push_history(
+            f"KALDIRILDI • Discord={record['discord_id'] or '—'} • Roblox={record['roblox_username'] or '—'} • Moderator={moderator.id}"
+        )
+
+        embed = discord.Embed(
+            title="✅ UNBLACKLIST",
+            description="Aktif blacklist kaydı kaldırıldı.",
+            color=discord.Color.green(),
+            timestamp=discord.utils.utcnow(),
+        )
+
+        if record["discord_id"]:
+            embed.add_field(
+                name="Discord",
+                value=f"<@{record['discord_id']}>\n`{record['discord_id']}`",
+                inline=True,
+            )
+
+        if record["roblox_username"]:
+            embed.add_field(
+                name="Roblox",
+                value=f"**{record['roblox_username']}**",
+                inline=True,
+            )
+
+        embed.add_field(
+            name="Sebep",
+            value=_truncate(str(record["reason"]), 1024),
+            inline=False,
+        )
+        embed.add_field(
+            name="Durum",
+            value="🟢 Pasif",
+            inline=True,
+        )
+
+        if announce_channel_id is not None:
+            embed.set_footer(text=f"İşlem kanalı: <#{announce_channel_id}>")
+
+        return BlacklistOperation(
+            success=True,
+            message="✅ Kayıt kaldırıldı.",
+            embed=embed,
+        )
+
+    # ========================================================
+    # DRAFT UTILITIES
     # ========================================================
 
     def update_draft_field(self, author_id: int, field_key: str, value: str) -> BlacklistDraft | None:
@@ -2275,21 +2223,30 @@ class Blacklist(commands.Cog):
             draft = replace(draft, reason=self.normalize_reason(value))
         elif field_key == "discord":
             discord_id = _parse_discord_id(value)
-            if discord_id is None:
-                return draft
-            draft = replace(draft, discord_id=discord_id, discord_label=value.strip())
+            if discord_id is not None:
+                draft = replace(draft, discord_id=discord_id, discord_label=value.strip())
         elif field_key == "roblox":
             username = _parse_roblox_username_hint(value)
-            if username is None:
-                return draft
-            draft = replace(draft, roblox_username=username)
+            if username is not None:
+                draft = replace(draft, roblox_username=username)
         elif field_key == "kick":
-            draft = replace(draft, kick_now=value.strip().lower() in {"1", "true", "yes", "on", "evet"})
+            draft = replace(
+                draft,
+                kick_now=value.strip().lower() in {"1", "true", "yes", "on", "evet"},
+            )
         else:
             return draft
 
         self.set_session(author_id, draft=draft)
         return draft
+
+    def normalize_reason(self, reason: str | None) -> str:
+        if not reason:
+            return "Sebep belirtilmedi."
+        cleaned = reason.strip()
+        if not cleaned:
+            return "Sebep belirtilmedi."
+        return cleaned[:MAX_REASON_LENGTH]
 
     # ========================================================
     # SAFE RESPONSES
@@ -2298,7 +2255,6 @@ class Blacklist(commands.Cog):
     async def safe_initial_response(
         self,
         interaction: discord.Interaction,
-        *,
         content: str,
     ) -> None:
         try:
@@ -2357,20 +2313,6 @@ class Blacklist(commands.Cog):
 
         self.logger.exception("Blacklist prefix command error.")
         await ctx.send("❌ Beklenmeyen bir hata oluştu.", delete_after=8)
-
-    # ========================================================
-    # ADDITIONAL UTILITIES
-    # ========================================================
-
-    def normalize_reason(self, reason: str | None) -> str:
-        if not reason:
-            return "Sebep belirtilmedi."
-
-        cleaned = reason.strip()
-        if not cleaned:
-            return "Sebep belirtilmedi."
-
-        return cleaned[:MAX_REASON_LENGTH]
 
 
 # ============================================================
