@@ -40,17 +40,7 @@ MAX_ROBLOX_USERNAME_LENGTH = 20
 )
 class SayMessageData:
     """
-    Say mesajının normalize edilmiş verisi.
-
-    Gelecekte buraya:
-
-        - color
-        - image_url
-        - footer
-        - mention_type
-        - target_channel_id
-
-    gibi alanlar eklenebilir.
+    /say mesajı için normalize edilmiş veri modeli.
     """
 
     title: str
@@ -71,17 +61,25 @@ class SayMessageData:
 
 class SayModal(discord.ui.Modal):
     """
-    PAG yayın mesajı oluşturma modalı.
+    PAG Say mesajı oluşturma paneli.
 
-    Kullanıcıdan:
+    Alanlar:
 
-        - Başlık
-        - Ana yazı
-        - Ek yazı 1
-        - Ek yazı 2
-        - Roblox kullanıcı adı
+        1. Başlık
+        2. Ana yazı
+        3. Ek yazı 1
+        4. Ek yazı 2
+        5. Roblox kullanıcı adı
 
-    alır.
+    Roblox kullanıcı adı girilirse:
+
+        Username
+            ↓
+        RobloxUser
+            ↓
+        Avatar
+            ↓
+        Embed Thumbnail
     """
 
     def __init__(
@@ -113,7 +111,7 @@ class SayModal(discord.ui.Modal):
         # MAIN TEXT
         # ====================================================
 
-        self.main_text = discord.ui.TextInput(
+        self.main_text_input = discord.ui.TextInput(
             label="Ana Yazı",
             placeholder=(
                 "Ana duyuru metnini yaz..."
@@ -128,7 +126,7 @@ class SayModal(discord.ui.Modal):
         # SECOND TEXT
         # ====================================================
 
-        self.second_text = discord.ui.TextInput(
+        self.second_text_input = discord.ui.TextInput(
             label="Ek Yazı 1",
             placeholder=(
                 "İsteğe bağlı ek yazı..."
@@ -142,7 +140,7 @@ class SayModal(discord.ui.Modal):
         # THIRD TEXT
         # ====================================================
 
-        self.third_text = discord.ui.TextInput(
+        self.third_text_input = discord.ui.TextInput(
             label="Ek Yazı 2",
             placeholder=(
                 "İsteğe bağlı ek yazı..."
@@ -156,7 +154,7 @@ class SayModal(discord.ui.Modal):
         # ROBLOX USERNAME
         # ====================================================
 
-        self.roblox_username = discord.ui.TextInput(
+        self.roblox_username_input = discord.ui.TextInput(
             label="Roblox Kullanıcı Adı",
             placeholder=(
                 "Avatar eklemek için isteğe bağlı..."
@@ -166,7 +164,7 @@ class SayModal(discord.ui.Modal):
         )
 
         # ====================================================
-        # ADD COMPONENTS
+        # REGISTER INPUTS
         # ====================================================
 
         self.add_item(
@@ -174,19 +172,19 @@ class SayModal(discord.ui.Modal):
         )
 
         self.add_item(
-            self.main_text,
+            self.main_text_input,
         )
 
         self.add_item(
-            self.second_text,
+            self.second_text_input,
         )
 
         self.add_item(
-            self.third_text,
+            self.third_text_input,
         )
 
         self.add_item(
-            self.roblox_username,
+            self.roblox_username_input,
         )
 
     # ========================================================
@@ -198,11 +196,11 @@ class SayModal(discord.ui.Modal):
         interaction: discord.Interaction,
     ) -> None:
         """
-        Modal gönderildiğinde çalışır.
+        Modal submit işlemi.
         """
 
         # ----------------------------------------------------
-        # IMMEDIATE RESPONSE
+        # IMMEDIATE ACKNOWLEDGEMENT
         # ----------------------------------------------------
 
         try:
@@ -218,38 +216,42 @@ class SayModal(discord.ui.Modal):
         except discord.HTTPException:
 
             self.cog.logger.exception(
-                "Failed to acknowledge /say modal.",
+                "Failed to defer /say modal interaction.",
             )
 
             return
 
         # ----------------------------------------------------
-        # NORMALIZE INPUT
+        # NORMALIZE
         # ----------------------------------------------------
 
         data = SayMessageData(
-            title=self.title_input.value.strip(),
+            title=(
+                self.title_input.value.strip()
+            ),
 
-            main_text=self.main_text.value.strip(),
+            main_text=(
+                self.main_text_input.value.strip()
+            ),
 
             second_text=(
-                self.second_text.value.strip()
+                self.second_text_input.value.strip()
                 or None
             ),
 
             third_text=(
-                self.third_text.value.strip()
+                self.third_text_input.value.strip()
                 or None
             ),
 
             roblox_username=(
-                self.roblox_username.value.strip()
+                self.roblox_username_input.value.strip()
                 or None
             ),
         )
 
         # ----------------------------------------------------
-        # VALIDATE INPUT
+        # VALIDATE
         # ----------------------------------------------------
 
         validation_error = (
@@ -260,7 +262,7 @@ class SayModal(discord.ui.Modal):
 
         if validation_error:
 
-            await self.cog.safe_edit_response(
+            await self.cog.safe_followup(
                 interaction,
                 content=(
                     f"❌ {validation_error}"
@@ -282,17 +284,17 @@ class SayModal(discord.ui.Modal):
 
         except PermissionError:
 
-            await self.cog.safe_edit_response(
+            await self.cog.safe_followup(
                 interaction,
                 content=(
                     "❌ Botun bu kanala mesaj gönderme "
-                    "yetkisi yok."
+                    "yetkisi bulunmuyor."
                 ),
             )
 
         except discord.Forbidden:
 
-            await self.cog.safe_edit_response(
+            await self.cog.safe_followup(
                 interaction,
                 content=(
                     "❌ Discord botun bu mesajı göndermesine "
@@ -302,10 +304,10 @@ class SayModal(discord.ui.Modal):
 
         except discord.NotFound:
 
-            await self.cog.safe_edit_response(
+            await self.cog.safe_followup(
                 interaction,
                 content=(
-                    "❌ Kanal veya Discord mesajı artık "
+                    "❌ Kanal veya interaction artık "
                     "bulunamıyor."
                 ),
             )
@@ -316,11 +318,10 @@ class SayModal(discord.ui.Modal):
                 "Discord API error while executing /say.",
             )
 
-            await self.cog.safe_edit_response(
+            await self.cog.safe_followup(
                 interaction,
                 content=(
-                    "❌ Discord API hatası oluştu. "
-                    "Lütfen tekrar deneyin."
+                    "❌ Discord API hatası oluştu."
                 ),
             )
 
@@ -330,11 +331,10 @@ class SayModal(discord.ui.Modal):
                 "Unexpected error while executing /say.",
             )
 
-            await self.cog.safe_edit_response(
+            await self.cog.safe_followup(
                 interaction,
                 content=(
-                    "❌ Mesaj gönderilirken beklenmeyen "
-                    "bir hata oluştu."
+                    "❌ Beklenmeyen bir hata oluştu."
                 ),
             )
 
@@ -346,25 +346,34 @@ class SayModal(discord.ui.Modal):
 
 class Say(commands.Cog):
     """
-    PAG say/yayın sistemi.
+    PAG Say sistemi.
 
-    Mimari:
+    Slash:
 
         /say
-          ↓
-        Permission Check
-          ↓
+
+    Prefix:
+
+        !say
+
+    /say:
+
+        Admin
+            ↓
         Modal
-          ↓
-        Input Validation
-          ↓
-        Roblox Enrichment
-          ↓
-        Embed Builder
-          ↓
-        Discord Message Sender
-          ↓
-        Private Result
+            ↓
+        Validation
+            ↓
+        Roblox enrichment
+            ↓
+        Embed
+            ↓
+        @everyone
+            ↓
+        Success response
+
+    Roblox API başarısız olursa
+    ana mesaj yine gönderilir.
     """
 
     def __init__(
@@ -384,25 +393,27 @@ class Say(commands.Cog):
         self.logger = logger
 
     # ========================================================
-    # SAY COMMAND
+    # SLASH COMMAND
     # ========================================================
 
     @app_commands.command(
         name="say",
         description=(
-            "PAG adına özel bir mesaj gönderir."
+            "PAG adına özel bir duyuru mesajı oluşturur."
         ),
     )
+    @app_commands.guild_only()
     @app_commands.default_permissions(
         administrator=True,
     )
-    @app_commands.guild_only()
     async def say(
         self,
         interaction: discord.Interaction,
     ) -> None:
         """
-        Say panelini açar.
+        /say komutu.
+
+        Discord'da slash command olarak görünür.
         """
 
         # ----------------------------------------------------
@@ -411,10 +422,10 @@ class Say(commands.Cog):
 
         if interaction.guild is None:
 
-            await self.safe_send_response(
+            await self.safe_initial_response(
                 interaction,
                 content=(
-                    "❌ Bu komut yalnızca sunucuda "
+                    "❌ Bu komut yalnızca sunucularda "
                     "kullanılabilir."
                 ),
             )
@@ -432,7 +443,7 @@ class Say(commands.Cog):
             discord.Member,
         ):
 
-            await self.safe_send_response(
+            await self.safe_initial_response(
                 interaction,
                 content=(
                     "❌ Sunucu üye bilgisi alınamadı."
@@ -442,12 +453,12 @@ class Say(commands.Cog):
             return
 
         # ----------------------------------------------------
-        # PERMISSION CHECK
+        # ADMIN CHECK
         # ----------------------------------------------------
 
         if not member.guild_permissions.administrator:
 
-            await self.safe_send_response(
+            await self.safe_initial_response(
                 interaction,
                 content=(
                     "❌ Bu komutu yalnızca sunucu "
@@ -486,7 +497,7 @@ class Say(commands.Cog):
 
             if not interaction.response.is_done():
 
-                await self.safe_send_response(
+                await self.safe_initial_response(
                     interaction,
                     content=(
                         "❌ Say paneli açılırken "
@@ -495,7 +506,66 @@ class Say(commands.Cog):
                 )
 
     # ========================================================
-    # VALIDATE MESSAGE DATA
+    # PREFIX COMMAND
+    # ========================================================
+
+    @commands.command(
+        name="say",
+    )
+    @commands.guild_only()
+    async def say_prefix(
+        self,
+        ctx: commands.Context,
+    ) -> None:
+        """
+        !say komutu.
+
+        Prefix komutları doğrudan Modal açamaz.
+        Bu nedenle kullanıcıya slash command kullanması
+        gerektiğini bildirir.
+
+        Asıl panel:
+
+            /say
+        """
+
+        if ctx.guild is None:
+
+            await ctx.send(
+                "❌ Bu komut yalnızca sunucularda "
+                "kullanılabilir.",
+            )
+
+            return
+
+        if not isinstance(
+            ctx.author,
+            discord.Member,
+        ):
+
+            return
+
+        if not ctx.author.guild_permissions.administrator:
+
+            await ctx.send(
+                "❌ Bu komutu yalnızca sunucu "
+                "yöneticileri kullanabilir.",
+            )
+
+            return
+
+        await ctx.send(
+            (
+                "📢 **PAG Say Paneli**\n\n"
+                "Say mesajı oluşturmak için "
+                "slash command kullan:\n\n"
+                "`/say`"
+            ),
+            delete_after=10,
+        )
+
+    # ========================================================
+    # VALIDATE
     # ========================================================
 
     def validate_message_data(
@@ -503,11 +573,12 @@ class Say(commands.Cog):
         data: SayMessageData,
     ) -> Optional[str]:
         """
-        Say mesajı verilerini doğrular.
-
-        Gelecekte yeni validation kuralları
-        buraya eklenebilir.
+        Kullanıcı verilerini doğrular.
         """
+
+        # ----------------------------------------------------
+        # TITLE
+        # ----------------------------------------------------
 
         if not data.title:
 
@@ -515,57 +586,61 @@ class Say(commands.Cog):
                 "Başlık boş bırakılamaz."
             )
 
+        if len(data.title) > MAX_TITLE_LENGTH:
+
+            return (
+                "Başlık izin verilen maksimum "
+                "uzunluğu aşıyor."
+            )
+
+        # ----------------------------------------------------
+        # MAIN TEXT
+        # ----------------------------------------------------
+
         if not data.main_text:
 
             return (
                 "Ana yazı boş bırakılamaz."
             )
 
-        if (
-            len(data.title)
-            > MAX_TITLE_LENGTH
-        ):
-
-            return (
-                "Başlık çok uzun."
-            )
-
-        if (
-            len(data.main_text)
-            > MAX_MAIN_TEXT_LENGTH
-        ):
+        if len(data.main_text) > MAX_MAIN_TEXT_LENGTH:
 
             return (
                 "Ana yazı çok uzun."
             )
 
+        # ----------------------------------------------------
+        # SECOND TEXT
+        # ----------------------------------------------------
+
         if data.second_text:
 
-            if (
-                len(data.second_text)
-                > MAX_EXTRA_TEXT_LENGTH
-            ):
+            if len(data.second_text) > MAX_EXTRA_TEXT_LENGTH:
 
                 return (
                     "Ek Yazı 1 çok uzun."
                 )
 
+        # ----------------------------------------------------
+        # THIRD TEXT
+        # ----------------------------------------------------
+
         if data.third_text:
 
-            if (
-                len(data.third_text)
-                > MAX_EXTRA_TEXT_LENGTH
-            ):
+            if len(data.third_text) > MAX_EXTRA_TEXT_LENGTH:
 
                 return (
                     "Ek Yazı 2 çok uzun."
                 )
 
+        # ----------------------------------------------------
+        # ROBLOX USERNAME
+        # ----------------------------------------------------
+
         if data.roblox_username:
 
-            if (
-                len(data.roblox_username)
-                > MAX_ROBLOX_USERNAME_LENGTH
+            if len(data.roblox_username) > (
+                MAX_ROBLOX_USERNAME_LENGTH
             ):
 
                 return (
@@ -585,7 +660,7 @@ class Say(commands.Cog):
         data: SayMessageData,
     ) -> None:
         """
-        Say mesajının ana akışını yönetir.
+        Say mesajını oluşturur ve gönderir.
         """
 
         # ----------------------------------------------------
@@ -597,7 +672,7 @@ class Say(commands.Cog):
         if channel is None:
 
             raise PermissionError(
-                "Interaction channel is unavailable."
+                "Interaction channel unavailable.",
             )
 
         if not isinstance(
@@ -606,11 +681,11 @@ class Say(commands.Cog):
         ):
 
             raise PermissionError(
-                "Interaction channel is not messageable."
+                "Channel is not messageable.",
             )
 
         # ----------------------------------------------------
-        # EMBED
+        # BUILD EMBED
         # ----------------------------------------------------
 
         embed = await self.build_embed(
@@ -621,46 +696,21 @@ class Say(commands.Cog):
         # SEND
         # ----------------------------------------------------
 
-        try:
-
-            await channel.send(
-                content="@everyone",
-                embed=embed,
-                allowed_mentions=(
-                    discord.AllowedMentions(
-                        everyone=True,
-                    )
-                ),
-            )
-
-        except discord.Forbidden:
-
-            self.logger.error(
-                (
-                    "Bot lacks permission to send "
-                    "message in channel=%s"
-                ),
-                channel.id,
-            )
-
-            raise
-
-        except discord.HTTPException:
-
-            self.logger.exception(
-                (
-                    "Discord HTTP error while sending "
-                    "say message."
-                ),
-            )
-
-            raise
+        await channel.send(
+            content="@everyone",
+            embed=embed,
+            allowed_mentions=(
+                discord.AllowedMentions(
+                    everyone=True,
+                )
+            ),
+        )
 
         # ----------------------------------------------------
-        # PRIVATE RESULT
+        # SUCCESS
         # ----------------------------------------------------
 
-        await self.safe_edit_response(
+        await self.safe_followup(
             interaction,
             content=(
                 "✅ Mesaj başarıyla gönderildi."
@@ -669,7 +719,7 @@ class Say(commands.Cog):
 
         self.logger.info(
             (
-                "Say message sent successfully: "
+                "Say message sent: "
                 "user=%s guild=%s channel=%s"
             ),
             interaction.user.id,
@@ -688,7 +738,7 @@ class Say(commands.Cog):
         data: SayMessageData,
     ) -> discord.Embed:
         """
-        Say embed'ini oluşturur.
+        Embed oluşturur.
         """
 
         embed = discord.Embed(
@@ -722,7 +772,7 @@ class Say(commands.Cog):
             )
 
         # ----------------------------------------------------
-        # ROBLOX DATA
+        # ROBLOX ENRICHMENT
         # ----------------------------------------------------
 
         if data.roblox_username:
@@ -745,10 +795,12 @@ class Say(commands.Cog):
         username: str,
     ) -> None:
         """
-        Roblox avatarını embed'e eklemeyi dener.
+        Roblox avatarını eklemeyi dener.
 
-        Roblox başarısız olursa ana mesajın
-        gönderilmesi engellenmez.
+        ÖNEMLİ:
+
+        Roblox API başarısız olursa
+        ana mesajın gönderilmesi engellenmez.
         """
 
         try:
@@ -794,7 +846,7 @@ class Say(commands.Cog):
             self.logger.warning(
                 (
                     "Roblox API failed "
-                    "for /say."
+                    "while enriching /say."
                 ),
                 exc_info=True,
             )
@@ -809,41 +861,135 @@ class Say(commands.Cog):
             )
 
     # ========================================================
-    # SAFE SEND RESPONSE
+    # SAFE INITIAL RESPONSE
     # ========================================================
 
-    async def safe_send_response(
+    async def safe_initial_response(
         self,
         interaction: discord.Interaction,
         *,
         content: str,
     ) -> None:
         """
-        Interaction'a güvenli şekilde cevap verir.
+        Henüz cevap verilmemiş interaction için güvenli cevap.
         """
 
         try:
 
             if interaction.response.is_done():
 
-                await interaction.followup.send(
-                    content,
-                    ephemeral=True,
+                await self.safe_followup(
+                    interaction,
+                    content=content,
                 )
 
-            else:
+                return
 
-                await interaction.response.send_message(
-                    content,
-                    ephemeral=True,
-                )
+            await interaction.response.send_message(
+                content,
+                ephemeral=True,
+            )
+
+        except discord.NotFound:
+
+            self.logger.warning(
+                "Interaction expired before response.",
+            )
+
         except discord.HTTPException:
 
             self.logger.exception(
+                "Failed to send initial interaction response.",
+            )
+
+    # ========================================================
+    # SAFE FOLLOWUP
+    # ========================================================
+
+    async def safe_followup(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str,
+    ) -> None:
+        """
+        Defer edilmiş interaction'a güvenli cevap verir.
+        """
+
+        try:
+
+            await interaction.followup.send(
+                content=content,
+                ephemeral=True,
+            )
+
+        except discord.NotFound:
+
+            self.logger.warning(
+                "Interaction expired before followup.",
+            )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                "Failed to send interaction followup.",
+            )
+
+    # ========================================================
+    # ERROR HANDLER
+    # ========================================================
+
+    @say.error
+    async def say_error(
+        self,
+        ctx: commands.Context,
+        error: commands.CommandError,
+    ) -> None:
+        """
+        Prefix command hata yöneticisi.
+        """
+
+        if isinstance(
+            error,
+            commands.NoPrivateMessage,
+        ):
+
+            return
+
+        if isinstance(
+            error,
+            commands.MissingPermissions,
+        ):
+
+            await ctx.send(
                 (
-                    "Failed to edit original "
-                    "interaction response."
+                    "❌ Bu komutu kullanmak için "
+                    "yönetici yetkisine sahip olmalısın."
                 ),
+                delete_after=8,
+            )
+
+            return
+
+        self.logger.exception(
+            "Prefix /say error: %s",
+            error,
+        )
+
+        try:
+
+            await ctx.send(
+                (
+                    "❌ /say çalıştırılırken "
+                    "beklenmeyen bir hata oluştu."
+                ),
+                delete_after=8,
+            )
+
+        except discord.HTTPException:
+
+            self.logger.exception(
+                "Failed to send prefix /say error.",
             )
 
 
