@@ -508,7 +508,7 @@ class Database:
         Example:
 
             await database.execute(
-                """
+                '''
                 INSERT INTO users (
                     discord_id,
                     rank,
@@ -516,7 +516,7 @@ class Database:
                     updated_at
                 )
                 VALUES (?, ?, ?, ?)
-                """,
+                '''
                 (
                     discord_id,
                     "RT",
