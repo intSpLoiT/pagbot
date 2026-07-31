@@ -132,133 +132,261 @@ class PAGBot(commands.Bot):
     # SETUP HOOK
     # ========================================================
 
-async def setup_hook(self) -> None:
-    """
-    Discord bağlantısı kurulmadan önce çalışır.
+    async def setup_hook(
+        self,
+    ) -> None:
+        """
+        Discord bağlantısı kurulmadan önce çalışır.
 
-    Initialization sırası:
+        Initialization sırası:
 
-        Database
-            ↓
-        Migrations
-            ↓
-        Services
-            ↓
-        Cogs
-            ↓
-        Guild Slash Command Sync
-    """
+            Database
+                ↓
+            Migrations
+                ↓
+            Roblox Service
+                ↓
+            Discord Service
+                ↓
+            Event Service
+                ↓
+            Moderation Service
+                ↓
+            Cog Loading
+                ↓
+            Guild Command Registration
+                ↓
+            Guild Slash Command Sync
+                ↓
+            Final Verification
+        """
 
-    if self._started:
+        if self._started:
 
-        self.logger.debug(
-            "PAG Bot initialization already completed.",
-        )
+            self.logger.debug(
+                "PAG Bot initialization already completed.",
+            )
 
-        return
-
-    self.logger.info(
-        "Starting PAG Bot initialization...",
-    )
-
-    try:
-
-        # ====================================================
-        # DATABASE
-        # ====================================================
-
-        await self.database.connect()
-
-        self.logger.info(
-            "Database connected.",
-        )
-
-        # ====================================================
-        # MIGRATIONS
-        # ====================================================
-
-        await self._run_migrations()
-
-        # ====================================================
-        # SERVICES
-        # ====================================================
-
-        await self.roblox_service.start()
+            return
 
         self.logger.info(
-            "Roblox service started.",
+            "Starting PAG Bot initialization...",
         )
 
-        await self._start_discord_service()
+        initialization_started = time.monotonic()
 
-        await self._start_event_service()
+        try:
 
-        # ====================================================
-        # MODERATION SERVICE
-        # ====================================================
-
-        if hasattr(self, "moderation_service"):
-
-            await self.moderation_service.initialize()
+            # ====================================================
+            # DATABASE
+            # ====================================================
 
             self.logger.info(
-                "Moderation service initialized.",
+                "Initializing database...",
             )
 
-        # ====================================================
-        # COGS
-        # ====================================================
+            await self.database.connect()
 
-        await self.cog_loader.load_all()
+            self.logger.info(
+                "Database connected successfully.",
+            )
 
-        self.logger.info(
-            "All cogs loaded.",
-        )
+            # ====================================================
+            # DATABASE MIGRATIONS
+            # ====================================================
 
-        # ====================================================
-        # GUILD COMMAND REGISTRATION
-        # ====================================================
+            self.logger.info(
+                "Running database migrations...",
+            )
 
-        self.tree.copy_global_to(
-            guild=self.guild_object,
-        )
+            await self._run_migrations()
 
-        # ====================================================
-        # SLASH COMMAND SYNC
-        # ====================================================
+            self.logger.info(
+                "Database migrations completed.",
+            )
 
-        await self._sync_commands()
+            # ====================================================
+            # ROBLOX SERVICE
+            # ====================================================
 
-        synced_count = len(
-            self.tree.get_commands(
+            self.logger.info(
+                "Starting Roblox service...",
+            )
+
+            await self.roblox_service.start()
+
+            self.logger.info(
+                "Roblox service started.",
+            )
+
+            # ====================================================
+            # DISCORD SERVICE
+            # ====================================================
+
+            self.logger.info(
+                "Starting Discord service...",
+            )
+
+            await self._start_discord_service()
+
+            self.logger.info(
+                "Discord service ready.",
+            )
+
+            # ====================================================
+            # EVENT SERVICE
+            # ====================================================
+
+            self.logger.info(
+                "Starting event service...",
+            )
+
+            await self._start_event_service()
+
+            self.logger.info(
+                "Event service ready.",
+            )
+
+            # ====================================================
+            # MODERATION SERVICE
+            # ====================================================
+
+            if hasattr(self, "moderation_service") and self.moderation_service is not None:
+
+                self.logger.info(
+                    "Initializing moderation service...",
+                )
+
+                await self.moderation_service.initialize()
+
+                self.logger.info(
+                    "Moderation service initialized.",
+                )
+
+            else:
+
+                self.logger.warning(
+                    "Moderation service not found. Moderation features may be unavailable.",
+                )
+
+            # ====================================================
+            # COG LOADING
+            # ====================================================
+
+            self.logger.info(
+                "Loading cogs...",
+            )
+
+            await self.cog_loader.load_all()
+
+            loaded_cogs = len(
+                self.cogs,
+            )
+
+            self.logger.info(
+                "Loaded %s cogs.",
+                loaded_cogs,
+            )
+
+            # ====================================================
+            # GUILD COMMAND REGISTRATION
+            # ====================================================
+
+            self.logger.info(
+                "Preparing guild command tree...",
+            )
+
+            self.tree.copy_global_to(
                 guild=self.guild_object,
             )
-        )
 
-        self.logger.info(
-            "Guild command tree contains %s commands.",
-            synced_count,
-        )
+            local_command_count = len(
+                self.tree.get_commands(
+                    guild=self.guild_object,
+                ),
+            )
 
-        # ====================================================
-        # INITIALIZATION COMPLETE
-        # ====================================================
+            self.logger.info(
+                "Guild command tree prepared with %s commands.",
+                local_command_count,
+            )
 
-        self._started = True
+            # ====================================================
+            # SLASH COMMAND SYNC
+            # ====================================================
 
-        self.logger.info(
-            "PAG Bot initialization completed successfully.",
-        )
+            self.logger.info(
+                "Synchronizing slash commands...",
+            )
 
-    except Exception:
+            await self._sync_commands()
 
-        self.logger.exception(
-            "PAG Bot initialization failed.",
-        )
+            synced_commands = self.tree.get_commands(
+                guild=self.guild_object,
+            )
 
-        self._started = False
+            synced_count = len(
+                synced_commands,
+            )
 
-        raise
+            self.logger.info(
+                "Slash command synchronization completed.",
+            )
+
+            self.logger.info(
+                "Guild command count: %s.",
+                synced_count,
+            )
+
+            # ====================================================
+            # COMMAND VERIFICATION
+            # ====================================================
+
+            if synced_count == 0:
+
+                self.logger.warning(
+                    "No slash commands were registered for the guild.",
+                )
+
+            else:
+
+                command_names = sorted(
+                    command.name
+                    for command in synced_commands
+                )
+
+                self.logger.debug(
+                    "Registered guild commands: %s",
+                    ", ".join(command_names),
+                )
+
+            # ====================================================
+            # INITIALIZATION COMPLETE
+            # ====================================================
+
+            self._started = True
+
+            initialization_time = (
+                time.monotonic()
+                - initialization_started
+            )
+
+            self.logger.info(
+                "PAG Bot initialization completed successfully in %.2f seconds.",
+                initialization_time,
+            )
+
+        except Exception:
+
+            self._started = False
+
+            self._commands_synced = False
+
+            self.logger.exception(
+                "PAG Bot initialization failed.",
+            )
+
+            raise
 
     # ========================================================
     # DATABASE MIGRATIONS
