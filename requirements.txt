@@ -1,5 +1,4 @@
 discord.py
 aiosqlite
-sqlite3
 httpx
 python-dotenv
