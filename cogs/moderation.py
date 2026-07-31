@@ -75,31 +75,7 @@ class UserProxy:
     avatar_url: str | None = None
 
 
-class ModerationRestrictedView(discord.ui.View):
-    def __init__(self, *, timeout: float = 180.0) -> None:
-        super().__init__(timeout=timeout)
-
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        guild = interaction.guild
-        user = interaction.user
-        if guild is None or not isinstance(user, discord.Member):
-            await interaction.response.send_message(
-                embed=PAGEmbeds.error("Hata", "Bu panel yalnızca sunucuda kullanılabilir."),
-                ephemeral=True,
-            )
-            return False
-
-        if not PAGPermissions.is_administrator(user):
-            await interaction.response.send_message(
-                embed=PAGEmbeds.error("Yetkisiz", "Bu paneli yalnızca administrator kullanabilir."),
-                ephemeral=True,
-            )
-            return False
-
-        return True
-
-
-class ModerationPaginatorView(ModerationRestrictedView):
+class ModerationPaginatorView(discord.ui.View):
     def __init__(self, embeds: list[discord.Embed], *, timeout: float = 120.0) -> None:
         super().__init__(timeout=timeout)
         self.embeds = embeds
@@ -157,13 +133,6 @@ class ModerationGIFModal(discord.ui.Modal):
             )
             return
 
-        if not PAGPermissions.is_administrator(user):
-            await interaction.response.send_message(
-                embed=PAGEmbeds.error("Yetkisiz", "Bu paneli yalnızca administrator kullanabilir."),
-                ephemeral=True,
-            )
-            return
-
         try:
             await self.cog.service.set_gif(guild.id, self.action_key, str(self.url_input.value), updated_by=user.id)
         except ModerationValidationError as error:
@@ -189,7 +158,7 @@ class ModerationGIFModal(discord.ui.Modal):
         )
 
 
-class ModerationGIFView(ModerationRestrictedView):
+class ModerationGIFView(discord.ui.View):
     def __init__(self, cog: "ModerationCog", *, timeout: float = 180.0) -> None:
         super().__init__(timeout=timeout)
         self.cog = cog
@@ -253,7 +222,7 @@ class ModerationGIFView(ModerationRestrictedView):
         await self.cog._send_panel(interaction, mode="main")
 
 
-class ModerationPanelView(ModerationRestrictedView):
+class ModerationPanelView(discord.ui.View):
     def __init__(self, cog: "ModerationCog", *, timeout: float = 180.0) -> None:
         super().__init__(timeout=timeout)
         self.cog = cog
@@ -346,10 +315,6 @@ class ModerationCog(commands.Cog):
         bot_member = self._bot_member(ctx.guild)
         if bot_member is not None and bot_member.top_role <= target.top_role:
             raise PAGPermissionError("Botun rolü hedef kullanıcıdan yüksek olmalı.")
-
-    def _require_admin_member(self, member: discord.Member) -> None:
-        if not PAGPermissions.is_administrator(member):
-            raise PAGPermissionError("Bu işlem yalnızca administrator içindir.")
 
     def _parse_duration(self, duration_text: str) -> ParsedDuration:
         text = duration_text.strip().lower()
@@ -488,14 +453,6 @@ class ModerationCog(commands.Cog):
             return
         await ctx.send(embed=embeds[0], view=ModerationPaginatorView(embeds))
 
-    async def _maybe_defer(self, ctx: commands.Context) -> None:
-        interaction = getattr(ctx, "interaction", None)
-        if interaction is not None and not interaction.response.is_done():
-            try:
-                await interaction.response.defer(thinking=True)
-            except Exception:
-                pass
-
     async def _apply_timeout(self, member: discord.Member, until: datetime | None, reason: str | None) -> None:
         timeout_method = getattr(member, "timeout", None)
         if callable(timeout_method):
@@ -591,9 +548,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="modpanel", description="Open the main moderation panel.")
     async def modpanel(self, ctx: commands.Context) -> None:
-        await self._maybe_defer(ctx)
-        assert isinstance(ctx.author, discord.Member)
-        self._require_admin_member(ctx.author)
         embed = PAGEmbeds.custom(
             title="PAG Moderation Panel",
             description=(
@@ -606,9 +560,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="modgif", description="Open the GIF settings panel.")
     async def modgif(self, ctx: commands.Context) -> None:
-        await self._maybe_defer(ctx)
-        assert isinstance(ctx.author, discord.Member)
-        self._require_admin_member(ctx.author)
         gifs = await self.service.list_gifs(ctx.guild.id)
         description = "Moderasyon GIF'lerini buradan ayarlayabilirsin. Bir butona bas, URL'yi yapıştır ve kaydet."
         if gifs:
@@ -628,7 +579,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="warn", description="Warn a member.")
     async def warn(self, ctx: commands.Context, member: discord.Member, *, reason: str) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         result = await self.service.create_warning(ctx.guild.id, member.id, ctx.author.id, reason, details={"source": "command"})
         active_count = len(await self.service.list_warnings(ctx.guild.id, user_id=member.id, active_only=True))
@@ -645,7 +595,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="warnings", description="Show a member's warnings.")
     async def warnings(self, ctx: commands.Context, member: discord.Member) -> None:
-        await self._maybe_defer(ctx)
         warnings = await self.service.list_warnings(ctx.guild.id, user_id=member.id)
         if not warnings:
             await ctx.send(embed=PAGEmbeds.info("Uyarı Yok", f"{member.mention} için kayıtlı uyarı yok."))
@@ -711,7 +660,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="note", description="Add a private moderation note.")
     async def note(self, ctx: commands.Context, member: discord.Member, *, note: str) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         result = await self.service.add_note(ctx.guild.id, member.id, ctx.author.id, note, details={"source": "command"})
         await self._send_action(
@@ -727,7 +675,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="notes", description="Show a member's moderation notes.")
     async def notes(self, ctx: commands.Context, member: discord.Member) -> None:
-        await self._maybe_defer(ctx)
         notes = await self.service.list_notes(ctx.guild.id, user_id=member.id)
         if not notes:
             await ctx.send(embed=PAGEmbeds.info("Not Yok", f"{member.mention} için kayıtlı not yok."))
@@ -793,7 +740,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="timeout", description="Timeout a member.")
     async def timeout(self, ctx: commands.Context, member: discord.Member, duration: str, *, reason: str) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         parsed = self._parse_duration(duration)
         until = discord.utils.utcnow() + timedelta(seconds=parsed.seconds)
@@ -819,7 +765,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="untimeout", description="Remove timeout from a member.")
     async def untimeout(self, ctx: commands.Context, member: discord.Member, *, reason: str | None = None) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         await self._apply_timeout(member, None, reason)
         case = await self.service.record_case(
@@ -842,7 +787,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="kick", description="Kick a member.")
     async def kick(self, ctx: commands.Context, member: discord.Member, *, reason: str) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         await member.kick(reason=reason)
         case = await self.service.record_case(ctx.guild.id, member.id, ctx.author.id, "kick", reason=reason, details={"source": "command"})
@@ -850,7 +794,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="ban", description="Ban a member.")
     async def ban(self, ctx: commands.Context, member: discord.Member, *, reason: str) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         await ctx.guild.ban(member, reason=reason)
         case = await self.service.record_case(ctx.guild.id, member.id, ctx.author.id, "ban", reason=reason, details={"source": "command"})
@@ -858,14 +801,12 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="unban", description="Unban a user by Discord user converter.")
     async def unban(self, ctx: commands.Context, user: discord.User, *, reason: str | None = None) -> None:
-        await self._maybe_defer(ctx)
         await ctx.guild.unban(user, reason=reason)
         case = await self.service.record_case(ctx.guild.id, user.id, ctx.author.id, "unban", reason=reason or "User unbanned.", details={"source": "command"})
         await self._send_action(ctx, action_key="unban", title="Ban Kaldırıldı", target=user, moderator=ctx.author, reason=reason or "User unbanned.", case_id=case.id)
 
     @commands.hybrid_command(name="nickname", description="Change or clear a member nickname.")
     async def nickname(self, ctx: commands.Context, member: discord.Member, *, nickname: str | None = None) -> None:
-        await self._maybe_defer(ctx)
         self._require_target_guard(ctx, member)
         old_nick = member.nick
         new_nick = None if nickname is None or nickname.strip().lower() in {"clear", "none", "-"} else nickname.strip()
@@ -896,7 +837,6 @@ class ModerationCog(commands.Cog):
         links: bool = False,
         webhooks: bool = False,
     ) -> None:
-        await self._maybe_defer(ctx)
         if not isinstance(ctx.channel, (discord.TextChannel, discord.Thread)):
             raise ModerationValidationError("Purge can only be used in text channels or threads.")
         if limit <= 0:
@@ -1031,7 +971,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="history", description="Show moderation history for a member or the guild.")
     async def history(self, ctx: commands.Context, member: discord.Member | None = None, limit: int = 15) -> None:
-        await self._maybe_defer(ctx)
         if limit <= 0:
             raise ModerationValidationError("Limit must be greater than zero.")
         limit = min(limit, 50)
@@ -1068,7 +1007,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="stats", description="Show moderation statistics.")
     async def stats(self, ctx: commands.Context, member: discord.Member | None = None) -> None:
-        await self._maybe_defer(ctx)
         stats = await self.service.get_statistics(ctx.guild.id, user_id=member.id if member else None)
         embed = PAGEmbeds.custom(
             title="Moderasyon İstatistikleri",
@@ -1093,7 +1031,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="searchuser", description="Search users in moderation records.")
     async def searchuser(self, ctx: commands.Context, *, query: str) -> None:
-        await self._maybe_defer(ctx)
         results = await self.service.search_users(ctx.guild.id, query, limit=10)
         if not results:
             await ctx.send(embed=PAGEmbeds.info("Sonuç Yok", "Aranan kullanıcı bulunamadı."))
@@ -1119,7 +1056,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="caseinfo", description="Show a specific moderation case.")
     async def caseinfo(self, ctx: commands.Context, case_id: int) -> None:
-        await self._maybe_defer(ctx)
         case = await self.service.get_case(case_id)
         if case is None or case.guild_id != ctx.guild.id:
             raise ModerationNotFoundError(f"Case not found: {case_id}")
@@ -1146,7 +1082,6 @@ class ModerationCog(commands.Cog):
 
     @commands.hybrid_command(name="editreason", description="Edit the reason of a case.")
     async def editreason(self, ctx: commands.Context, case_id: int, *, reason: str) -> None:
-        await self._maybe_defer(ctx)
         case = await self.service.get_case(case_id)
         if case is None or case.guild_id != ctx.guild.id:
             raise ModerationNotFoundError(f"Case not found: {case_id}")
