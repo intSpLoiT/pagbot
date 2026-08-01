@@ -144,21 +144,11 @@ class PAGBot(commands.Bot):
                 ↓
             Migrations
                 ↓
-            Roblox Service
+            Services
                 ↓
-            Discord Service
-                ↓
-            Event Service
-                ↓
-            Moderation Service
-                ↓
-            Cog Loading
-                ↓
-            Guild Command Registration
+            Cogs
                 ↓
             Guild Slash Command Sync
-                ↓
-            Final Verification
         """
 
         if self._started:
@@ -173,220 +163,65 @@ class PAGBot(commands.Bot):
             "Starting PAG Bot initialization...",
         )
 
-        initialization_started = time.monotonic()
+        # ====================================================
+        # DATABASE
+        # ====================================================
 
-        try:
+        await self.database.connect()
 
-            # ====================================================
-            # DATABASE
-            # ====================================================
+        self.logger.info(
+            "Database connected.",
+        )
 
-            self.logger.info(
-                "Initializing database...",
-            )
+        # ====================================================
+        # MIGRATIONS
+        # ====================================================
 
-            await self.database.connect()
+        await self._run_migrations()
 
-            self.logger.info(
-                "Database connected successfully.",
-            )
+        # ====================================================
+        # ROBLOX SERVICE
+        # ====================================================
 
-            # ====================================================
-            # DATABASE MIGRATIONS
-            # ====================================================
+        await self.roblox_service.start()
 
-            self.logger.info(
-                "Running database migrations...",
-            )
+        self.logger.info(
+            "Roblox service started.",
+        )
 
-            await self._run_migrations()
+        # ====================================================
+        # DISCORD SERVICE
+        # ====================================================
 
-            self.logger.info(
-                "Database migrations completed.",
-            )
+        await self._start_discord_service()
 
-            # ====================================================
-            # ROBLOX SERVICE
-            # ====================================================
+        # ====================================================
+        # EVENT SERVICE
+        # ====================================================
 
-            self.logger.info(
-                "Starting Roblox service...",
-            )
+        await self._start_event_service()
 
-            await self.roblox_service.start()
+        # ====================================================
+        # COGS
+        # ====================================================
 
-            self.logger.info(
-                "Roblox service started.",
-            )
+        await self.cog_loader.load_all()
 
-            # ====================================================
-            # DISCORD SERVICE
-            # ====================================================
+        # ====================================================
+        # SLASH COMMAND SYNC
+        # ====================================================
 
-            self.logger.info(
-                "Starting Discord service...",
-            )
+        await self._sync_commands()
 
-            await self._start_discord_service()
+        # ====================================================
+        # INITIALIZATION COMPLETE
+        # ====================================================
 
-            self.logger.info(
-                "Discord service ready.",
-            )
+        self._started = True
 
-            # ====================================================
-            # EVENT SERVICE
-            # ====================================================
-
-            self.logger.info(
-                "Starting event service...",
-            )
-
-            await self._start_event_service()
-
-            self.logger.info(
-                "Event service ready.",
-            )
-
-            # ====================================================
-            # MODERATION SERVICE
-            # ====================================================
-
-            if hasattr(self, "moderation_service") and self.moderation_service is not None:
-
-                self.logger.info(
-                    "Initializing moderation service...",
-                )
-
-                await self.moderation_service.initialize()
-
-                self.logger.info(
-                    "Moderation service initialized.",
-                )
-
-            else:
-
-                self.logger.warning(
-                    "Moderation service not found. Moderation features may be unavailable.",
-                )
-
-            # ====================================================
-            # COG LOADING
-            # ====================================================
-
-            self.logger.info(
-                "Loading cogs...",
-            )
-
-            await self.cog_loader.load_all()
-
-            loaded_cogs = len(
-                self.cogs,
-            )
-
-            self.logger.info(
-                "Loaded %s cogs.",
-                loaded_cogs,
-            )
-
-            # ====================================================
-            # GUILD COMMAND REGISTRATION
-            # ====================================================
-
-            self.logger.info(
-                "Preparing guild command tree...",
-            )
-
-            self.tree.copy_global_to(
-                guild=self.guild_object,
-            )
-
-            local_command_count = len(
-                self.tree.get_commands(
-                    guild=self.guild_object,
-                ),
-            )
-
-            self.logger.info(
-                "Guild command tree prepared with %s commands.",
-                local_command_count,
-            )
-
-            # ====================================================
-            # SLASH COMMAND SYNC
-            # ====================================================
-
-            self.logger.info(
-                "Synchronizing slash commands...",
-            )
-
-            await self._sync_commands()
-
-            synced_commands = self.tree.get_commands(
-                guild=self.guild_object,
-            )
-
-            synced_count = len(
-                synced_commands,
-            )
-
-            self.logger.info(
-                "Slash command synchronization completed.",
-            )
-
-            self.logger.info(
-                "Guild command count: %s.",
-                synced_count,
-            )
-
-            # ====================================================
-            # COMMAND VERIFICATION
-            # ====================================================
-
-            if synced_count == 0:
-
-                self.logger.warning(
-                    "No slash commands were registered for the guild.",
-                )
-
-            else:
-
-                command_names = sorted(
-                    command.name
-                    for command in synced_commands
-                )
-
-                self.logger.debug(
-                    "Registered guild commands: %s",
-                    ", ".join(command_names),
-                )
-
-            # ====================================================
-            # INITIALIZATION COMPLETE
-            # ====================================================
-
-            self._started = True
-
-            initialization_time = (
-                time.monotonic()
-                - initialization_started
-            )
-
-            self.logger.info(
-                "PAG Bot initialization completed successfully in %.2f seconds.",
-                initialization_time,
-            )
-
-        except Exception:
-
-            self._started = False
-
-            self._commands_synced = False
-
-            self.logger.exception(
-                "PAG Bot initialization failed.",
-            )
-
-            raise
+        self.logger.info(
+            "PAG Bot initialization completed.",
+        )
 
     # ========================================================
     # DATABASE MIGRATIONS
