@@ -31,6 +31,47 @@ GIF_KEYS = {
 }
 
 # ============================================================
+# GIF MODELS
+# ============================================================
+
+DEFAULT_GIF_KEY = "default"
+
+
+@dataclass(slots=True, frozen=True)
+class ModerationGIFRecord:
+    """
+    Moderation GIF ayar kaydı.
+    """
+
+    guild_id: int
+    gif_key: str
+    gif_url: str
+    updated_by: int | None
+    updated_at: str
+
+    @classmethod
+    def from_row(cls, row: Any) -> "ModerationGIFRecord":
+        return cls(
+            guild_id=int(row["guild_id"]),
+            gif_key=str(row["gif_key"]),
+            gif_url=str(row["gif_url"]),
+            updated_by=int(row["updated_by"])
+            if _row_has_key(row, "updated_by") and row["updated_by"] is not None
+            else None,
+            updated_at=str(row["updated_at"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "guild_id": self.guild_id,
+            "gif_key": self.gif_key,
+            "gif_url": self.gif_url,
+            "updated_by": self.updated_by,
+            "updated_at": self.updated_at,
+        }
+
+
+# ============================================================
 # ERRORS
 # ============================================================
 
