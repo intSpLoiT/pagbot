@@ -802,7 +802,78 @@ class ModerationService:
         )
 
         return int(cursor.lastrowid)
+    async def get_statistics(
+        self,
+        guild_id: int,
+        *,
+        user_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Moderation cog ile uyumluluk için istatistik döndürür."""
 
+        if user_id is not None:
+            return {
+                "warnings": await self.count_warnings(
+                    guild_id=guild_id,
+                    user_id=user_id,
+                    active_only=False,
+                ),
+                "active_warnings": await self.count_warnings(
+                    guild_id=guild_id,
+                    user_id=user_id,
+                    active_only=True,
+                ),
+                "notes": await self.count_notes(
+                    guild_id=guild_id,
+                    user_id=user_id,
+                    active_only=False,
+                ),
+                "mutes": await self.count_mutes(
+                    guild_id=guild_id,
+                    user_id=user_id,
+                    active_only=False,
+                ),
+            }
+
+        summary = await self.get_guild_summary(guild_id=guild_id)
+
+        return {
+            "warnings": summary["warnings_total"],
+            "active_warnings": summary["warnings_active"],
+            "notes": summary["notes_active"],
+            "mutes": summary["mutes_active"],
+        }
+
+
+    async def record_case(
+        self,
+        guild_id: int,
+        moderator_id: int,
+        target_user_id: int,
+        action: str,
+        *,
+        reason: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Moderation cog ile uyumluluk için vaka kaydı oluşturur."""
+
+        audit_id = await self.record_audit(
+            guild_id=guild_id,
+            action=action,
+            moderator_id=moderator_id,
+            target_user_id=target_user_id,
+            reason=reason,
+            payload=details,
+        )
+
+        return {
+            "id": audit_id,
+            "guild_id": guild_id,
+            "action": action,
+            "moderator_id": moderator_id,
+            "target_user_id": target_user_id,
+            "reason": reason,
+            "details": details,
+        }
     async def list_audit_logs(
         self,
         *,
