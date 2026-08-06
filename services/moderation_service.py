@@ -733,6 +733,22 @@ class ModerationService:
             ON {AUDIT_LOGS_TABLE}(target_user_id, created_at)
             """
         )
+        # GIFs
+        await self._ensure_column(MODERATION_GIFS_TABLE, "gif_key", "TEXT")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "gif_url", "TEXT")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "enabled", "INTEGER")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "created_by", "INTEGER")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "created_at", "TEXT")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "updated_at", "TEXT")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "source", "TEXT")
+        await self._ensure_column(MODERATION_GIFS_TABLE, "metadata_json", "TEXT")
+
+        await self.database.execute(
+            f"""
+            CREATE INDEX IF NOT EXISTS idx_{MODERATION_GIFS_TABLE}_guild_key
+            ON {MODERATION_GIFS_TABLE}(guild_id, gif_key)
+            """
+        )
 
     async def _ensure_column(
         self,
