@@ -1005,7 +1005,7 @@ class ModerationCog(commands.Cog):
             pages.append(embed)
         await self._send_pages(ctx, pages)
 
-    @commands.hybrid_command(name="stats", description="Show moderation statistics.")
+    @commands.hybrid_command(name="modstats", description="Show moderation statistics.")
     async def stats(self, ctx: commands.Context, member: discord.Member | None = None) -> None:
         stats = await self.service.get_statistics(ctx.guild.id, user_id=member.id if member else None)
         embed = PAGEmbeds.custom(
