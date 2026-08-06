@@ -638,27 +638,27 @@ class ModerationService:
             )
             """
         )
-    # ========================================================
-    # GIF SUPPORT
-    # ========================================================
+        # ========================================================
+        # GIF SUPPORT
+        # ========================================================
 
-    await self.database.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {MODERATION_GIFS_TABLE} (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            guild_id INTEGER NOT NULL,
-            gif_key TEXT NOT NULL DEFAULT '{DEFAULT_GIF_KEY}',
-            gif_url TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            created_by INTEGER,
-            created_at TEXT NOT NULL,
-            updated_at TEXT,
-            source TEXT NOT NULL DEFAULT 'discord',
-            metadata_json TEXT,
-            UNIQUE(guild_id, gif_key)
+        await self.database.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {MODERATION_GIFS_TABLE} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                gif_key TEXT NOT NULL DEFAULT '{DEFAULT_GIF_KEY}',
+                gif_url TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL,
+                updated_at TEXT,
+                source TEXT NOT NULL DEFAULT 'discord',
+                metadata_json TEXT,
+                UNIQUE(guild_id, gif_key)
+            )
+            """
         )
-        """
-    )
 
     async def _ensure_schema(self) -> None:
         """
