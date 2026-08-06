@@ -1250,7 +1250,294 @@ class ModerationService:
         user_id: int,
     ) -> bool:
         return (await self.count_warnings(guild_id=guild_id, user_id=user_id, active_only=True)) > 0
+    async def get_case(
+        self,
+        case_id: int,
+    ) -> dict[str, Any] | None:
+        """
+        ModerationCog uyumluluğu için tek case getirir.
 
+        case mantığı audit log üzerinden yürür.
+        """
+        await self.initialize()
+
+        case_id = _positive_int(case_id, "case_id")
+
+        row = await self.database.fetchone(
+            f"""
+            SELECT *
+            FROM {AUDIT_LOGS_TABLE}
+            WHERE id = ?
+            LIMIT 1
+            """,
+            (case_id,),
+        )
+
+        if row is None:
+            return None
+
+        return ModerationAuditRecord.from_row(row).to_dict()
+
+    async def list_cases(
+        self,
+        *,
+        guild_id: int,
+        user_id: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        """
+        ModerationCog uyumluluğu için case listesi döndürür.
+        """
+        await self.initialize()
+
+        guild_id = _positive_int(guild_id, "guild_id")
+        limit = max(1, min(int(limit), 500))
+        offset = max(0, int(offset))
+
+        clauses = ["guild_id = ?"]
+        params: list[Any] = [guild_id]
+
+        if user_id is not None:
+            params.append(_positive_int(user_id, "user_id"))
+            clauses.append("target_user_id = ?")
+
+        rows = await self.database.fetchall(
+            f"""
+            SELECT *
+            FROM {AUDIT_LOGS_TABLE}
+            WHERE {' AND '.join(clauses)}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            (*params, limit, offset),
+        )
+
+        return [ModerationAuditRecord.from_row(row).to_dict() for row in rows]
+
+    async def search_users(
+        self,
+        *,
+        guild_id: int,
+        query: str,
+        limit: int = 50,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """
+        ModerationCog uyumluluğu için kullanıcı araması.
+
+        Var olan search_user_records ile aynı çıktıyı döndürür.
+        """
+        return await self.search_user_records(
+            guild_id=guild_id,
+            query=query,
+            limit=limit,
+        )
+
+    async def set_mod_gif(
+        self,
+        *,
+        guild_id: int,
+        gif_url: str,
+        gif_key: str = DEFAULT_GIF_KEY,
+        created_by: int | None = None,
+        source: str = "discord",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Moderasyon GIF ayarı.
+        """
+        await self.initialize()
+
+        guild_id = _positive_int(guild_id, "guild_id")
+        gif_key = _normalize_text(gif_key, default=DEFAULT_GIF_KEY, max_length=80)
+        gif_url = _normalize_text(gif_url, default="", max_length=1000)
+
+        if not gif_url:
+            raise ModerationValidationError("gif_url cannot be empty.")
+
+        now = _utc_now()
+        existing = await self.database.fetchone(
+            f"""
+            SELECT *
+            FROM {MODERATION_GIFS_TABLE}
+            WHERE guild_id = ? AND gif_key = ?
+            LIMIT 1
+            """,
+            (guild_id, gif_key),
+        )
+
+        if existing is None:
+            await self.database.execute(
+                f"""
+                INSERT INTO {MODERATION_GIFS_TABLE} (
+                    guild_id,
+                    gif_key,
+                    gif_url,
+                    enabled,
+                    created_by,
+                    created_at,
+                    updated_at,
+                    source,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    guild_id,
+                    gif_key,
+                    gif_url,
+                    _coerce_optional_positive_int(created_by, "created_by"),
+                    now,
+                    now,
+                    source,
+                    _serialize_payload(metadata),
+                ),
+            )
+        else:
+            await self.database.execute(
+                f"""
+                UPDATE {MODERATION_GIFS_TABLE}
+                SET
+                    gif_url = ?,
+                    enabled = 1,
+                    created_by = COALESCE(?, created_by),
+                    updated_at = ?,
+                    source = ?,
+                    metadata_json = ?
+                WHERE guild_id = ? AND gif_key = ?
+                """,
+                (
+                    gif_url,
+                    _coerce_optional_positive_int(created_by, "created_by"),
+                    now,
+                    source,
+                    _serialize_payload(metadata),
+                    guild_id,
+                    gif_key,
+                ),
+            )
+
+        row = await self.database.fetchone(
+            f"""
+            SELECT *
+            FROM {MODERATION_GIFS_TABLE}
+            WHERE guild_id = ? AND gif_key = ?
+            LIMIT 1
+            """,
+            (guild_id, gif_key),
+        )
+
+        if row is None:
+            raise ModerationServiceError("Moderation GIF could not be reloaded.")
+
+        record = ModerationGIFRecord.from_row(row)
+
+        await self._safe_audit(
+            action="mod_gif_set",
+            guild_id=guild_id,
+            moderator_id=_coerce_optional_positive_int(created_by, "created_by"),
+            reason=gif_key,
+            payload=record.to_dict(),
+            source=source,
+        )
+
+        return record.to_dict()
+
+    async def get_mod_gif(
+        self,
+        *,
+        guild_id: int,
+        gif_key: str = DEFAULT_GIF_KEY,
+    ) -> dict[str, Any] | None:
+        """
+        Guild için tanımlı GIF'i döndürür.
+        """
+        await self.initialize()
+
+        guild_id = _positive_int(guild_id, "guild_id")
+        gif_key = _normalize_text(gif_key, default=DEFAULT_GIF_KEY, max_length=80)
+
+        row = await self.database.fetchone(
+            f"""
+            SELECT *
+            FROM {MODERATION_GIFS_TABLE}
+            WHERE guild_id = ? AND gif_key = ? AND enabled = 1
+            LIMIT 1
+            """,
+            (guild_id, gif_key),
+        )
+
+        if row is None:
+            row = await self.database.fetchone(
+                f"""
+                SELECT *
+                FROM {MODERATION_GIFS_TABLE}
+                WHERE guild_id = ? AND gif_key = ?
+                LIMIT 1
+                """,
+                (guild_id, DEFAULT_GIF_KEY),
+            )
+
+        if row is None:
+            return None
+
+        return ModerationGIFRecord.from_row(row).to_dict()
+
+    async def clear_mod_gif(
+        self,
+        *,
+        guild_id: int,
+        gif_key: str = DEFAULT_GIF_KEY,
+        removed_by: int | None = None,
+        source: str = "discord",
+    ) -> bool:
+        """
+        GIF'i devre dışı bırakır.
+        """
+        await self.initialize()
+
+        guild_id = _positive_int(guild_id, "guild_id")
+        gif_key = _normalize_text(gif_key, default=DEFAULT_GIF_KEY, max_length=80)
+
+        row = await self.database.fetchone(
+            f"""
+            SELECT id
+            FROM {MODERATION_GIFS_TABLE}
+            WHERE guild_id = ? AND gif_key = ?
+            LIMIT 1
+            """,
+            (guild_id, gif_key),
+        )
+
+        if row is None:
+            return False
+
+        await self.database.execute(
+            f"""
+            UPDATE {MODERATION_GIFS_TABLE}
+            SET
+                enabled = 0,
+                updated_at = ?,
+                source = ?
+            WHERE guild_id = ? AND gif_key = ?
+            """,
+            (
+                _utc_now(),
+                source,
+                guild_id,
+                gif_key,
+            ),
+        )
+
+        await self._safe_audit(
+            action="mod_gif_cleared",
+            guild_id=guild_id,
+            moderator_id=_coerce_optional_positive_int(removed_by, "removed_by"),
+            reason=gif_key,
+            source=source,
+        )
+
+        return True
     # ========================================================
     # NOTES
     # ========================================================
