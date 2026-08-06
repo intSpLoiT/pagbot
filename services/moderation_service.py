@@ -116,7 +116,8 @@ NOTES_TABLE = "notes"
 MUTES_TABLE = "mutes"
 CHANNEL_STATES_TABLE = "channel_states"
 AUDIT_LOGS_TABLE = "moderation_audit_logs"
-
+MODERATION_GIFS_TABLE = "moderation_gifs"
+DEFAULT_GIF_KEY = "default"
 MAX_REASON_LENGTH = 1000
 MAX_NOTE_LENGTH = 2000
 MAX_PAYLOAD_LENGTH = 8000
