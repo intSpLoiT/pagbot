@@ -511,7 +511,9 @@ class HelpRegistry:
 
         return None
 
-    def best_matches(self, query: str, *, limit: int = 5) -            ↓
+    def best_matches(self, query: str, *, limit: int = 5):
+        """
+        -            ↓
         Ana yardım paneli
             ↓
         Kategori seçimi
