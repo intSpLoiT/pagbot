@@ -511,619 +511,580 @@ class HelpRegistry:
 
         return None
 
-    def best_matches(self, query: str, *, limit: int = 5):
-        """
-        -            ↓
-        Ana yardım paneli
-            ↓
-        Kategori seçimi
-            ↓
-        Komut listesi
-            ↓
-        Geri dönüş
-    """
+    def best_matches(self, query: str, *, limit: int = 5) -> list[str]:
+        normalized = _normalize(query)
+        if not normalized:
+            return []
 
-    # ========================================================
-    # INIT
-    # ========================================================
+        names: list[str] = []
+        seen: set[str] = set()
 
-    def __init__(
-        self,
-        bot: commands.Bot,
-    ) -> None:
+        for category in self.categories:
+            for candidate in {category.key, category.title}:
+                key = _normalize(candidate)
+                if key not in seen:
+                    seen.add(key)
+                    names.append(candidate)
+            for entry in category.entries:
+                for candidate in {entry.qualified_name, entry.display_name(), *entry.aliases}:
+                    key = _normalize(candidate)
+                    if key not in seen:
+                        seen.add(key)
+                        names.append(candidate)
 
-        self.bot = bot
+        return get_close_matches(query, names, n=limit, cutoff=0.25)
 
-        self.logger: logging.Logger = (
-            getattr(
-                bot,
-                "logger",
-                logging.getLogger("PAG"),
-            )
-        )
-
-    # ========================================================
-    # HELP COMMAND
-    # ========================================================
-
-    @app_commands.command(
-        name="help",
-        description="PAG Bot yardım panelini açar.",
-    )
-    async def help_command(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        """
-        Ana yardım panelini gösterir.
-        """
-
-        embed = self._create_main_embed(
-            interaction,
-        )
-
-        view = HelpView(
-            bot=self.bot,
-            author_id=interaction.user.id,
-        )
-
-        await interaction.response.send_message(
-            embed=embed,
-            view=view,
-        )
-
-        self.logger.info(
-            "Help panel opened by %s (%s).",
-            interaction.user,
-            interaction.user.id,
-        )
-
-    # ========================================================
-    # MAIN EMBED
-    # ========================================================
-
-    def _create_main_embed(
-        self,
-        interaction: discord.Interaction,
-    ) -> discord.Embed:
-        """
-        Ana yardım embed'ini oluşturur.
-        """
-
-        guild_name = (
-            interaction.guild.name
-            if interaction.guild
-            else "Direct Messages"
-        )
-
-        embed = discord.Embed(
-            title="⚔️ PAG Bot • Help Center",
-            description=(
-                "PAG Bot'un tüm sistemlerine "
-                "buradan ulaşabilirsiniz.\n\n"
-
-                "Aşağıdaki menüden bir kategori seçerek "
-                "kullanılabilir komutları görüntüleyin."
-            ),
-            color=PAG_COLOR,
-        )
-
-        embed.add_field(
-            name="🧩 Sistem",
-            value=(
-                "PAG Bot aktif durumda.\n"
-                "Komut kategorisini aşağıdaki menüden seçin."
-            ),
-            inline=False,
-        )
-
-        embed.add_field(
-            name="📚 Kategoriler",
-            value=(
-                "👤 Profil & Kullanıcı\n"
-                "🎮 Roblox & Verification\n"
-                "🏆 Top 10 & Ranking\n"
-                "🎉 Events\n"
-                "🛡️ Moderation\n"
-                "⚙️ System\n"
-                "📢 Announcement"
-            ),
-            inline=True,
-        )
-
-        embed.add_field(
-            name="🌐 Sunucu",
-            value=(
-                f"`{guild_name}`\n"
-                f"👥 {len(interaction.guild.members) if interaction.guild else 0} members"
-            ),
-            inline=True,
-        )
-
-        embed.set_footer(
-            text=(
-                "PAG Bot • Select a category below"
-            ),
-        )
-
-        return embed
+    def list_stats(self) -> tuple[int, int, int]:
+        total = sum(len(category.entries) for category in self.categories)
+        prefix_only = sum(1 for category in self.categories for entry in category.entries if entry.has_prefix() and not entry.has_slash())
+        slash_only = sum(1 for category in self.categories for entry in category.entries if entry.has_slash() and not entry.has_prefix())
+        both = sum(1 for category in self.categories for entry in category.entries if entry.has_prefix() and entry.has_slash())
+        return total, prefix_only, slash_only, both
 
 
-# ============================================================
-# HELP VIEW
-# ============================================================
-
-class HelpView(
-    discord.ui.View,
-):
-    """
-    Ana yardım paneli View'ı.
-    """
-
-    def __init__(
-        self,
-        bot: commands.Bot,
-        author_id: int,
-    ) -> None:
-
-        super().__init__(
-            timeout=300,
-        )
-
-        self.bot = bot
-
-        self.author_id = author_id
-
-        self.add_item(
-            HelpSelect(
-                bot=bot,
-                author_id=author_id,
-            )
-        )
-
-    # ========================================================
-    # BACK BUTTON
-    # ========================================================
-
-    @discord.ui.button(
-        label="Ana Menü",
-        emoji="🏠",
-        style=discord.ButtonStyle.secondary,
-        row=1,
-    )
-    async def home_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
-
-        if interaction.user.id != self.author_id:
-
-            await interaction.response.send_message(
-                "❌ Bu yardım panelini yalnızca paneli açan kişi kullanabilir.",
-                ephemeral=True,
-            )
-
-            return
-
-        cog = self.bot.get_cog(
-            "Help",
-        )
-
-        if cog is None:
-
-            await interaction.response.send_message(
-                "❌ Help sistemi kullanılamıyor.",
-                ephemeral=True,
-            )
-
-            return
-
-        embed = cog._create_main_embed(
-            interaction,
-        )
-
-        await interaction.response.edit_message(
-            embed=embed,
-            view=self,
-        )
-
-
-# ============================================================
-# SELECT MENU
-# ============================================================
-
-class HelpSelect(
-    discord.ui.Select,
-):
-    """
-    Yardım kategorisi seçim menüsü.
-    """
-
-    def __init__(
-        self,
-        bot: commands.Bot,
-        author_id: int,
-    ) -> None:
-
-        self.bot = bot
-
-        self.author_id = author_id
-
+class HelpSelect(discord.ui.Select):
+    def __init__(self, view: "HelpView") -> None:
+        self.view_ref = view
         options = [
-
             discord.SelectOption(
-                label="Profil & Kullanıcı",
-                value="profile",
-                emoji="👤",
-                description="Profil ve kullanıcı komutları",
-            ),
-
-            discord.SelectOption(
-                label="Roblox & Verification",
-                value="roblox",
-                emoji="🎮",
-                description="Roblox ve doğrulama sistemleri",
-            ),
-
-            discord.SelectOption(
-                label="Top 10 & Ranking",
-                value="ranking",
-                emoji="🏆",
-                description="Sıralama ve Top 10 komutları",
-            ),
-
-            discord.SelectOption(
-                label="Events",
-                value="events",
-                emoji="🎉",
-                description="Etkinlik sistemleri",
-            ),
-
-            discord.SelectOption(
-                label="Moderation",
-                value="moderation",
-                emoji="🛡️",
-                description="Blacklist ve moderasyon",
-            ),
-
-            discord.SelectOption(
-                label="Server Tools",
-                value="tools",
-                emoji="🔧",
-                description="Say, write ve rol araçları",
-            ),
-
-            discord.SelectOption(
-                label="System",
-                value="system",
-                emoji="⚙️",
-                description="Bot ve sistem komutları",
-            ),
-
+                label=category.title,
+                value=category.key,
+                emoji=category.emoji,
+                description=_truncate(category.description, 100),
+            )
+            for category in view.registry.categories
+            if category.command_count > 0
         ]
 
         super().__init__(
-            placeholder="📚 Bir kategori seçin...",
+            placeholder="Bir kategori seç",
             min_values=1,
             max_values=1,
-            options=options,
-            custom_id=(
-                f"pag_help_select_{author_id}"
-            ),
+            options=options[:25],
+            row=0,
         )
 
-    # ========================================================
-    # CALLBACK
-    # ========================================================
-
-    async def callback(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-
-        if interaction.user.id != self.author_id:
-
-            await interaction.response.send_message(
-                "❌ Bu paneli yalnızca açan kişi kullanabilir.",
-                ephemeral=True,
-            )
-
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view_ref.ensure_author(interaction):
             return
+        self.view_ref.set_category(self.values[0])
+        await self.view_ref.refresh(interaction)
 
-        category = self.values[0]
 
-        embed = self._create_category_embed(
-            category,
+class HelpView(discord.ui.View):
+    def __init__(self, bot: commands.Bot, author_id: int, registry: HelpRegistry) -> None:
+        super().__init__(timeout=TIMEOUT_SECONDS)
+        self.bot = bot
+        self.author_id = author_id
+        self.registry = registry
+        self.state: str = "home"
+        self.active_category_key: str | None = None
+        self.active_entry: CommandEntry | None = None
+        self.page_index: int = 0
+        self.message: discord.Message | None = None
+
+        self.select = HelpSelect(self)
+        self.add_item(self.select)
+
+    async def ensure_author(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.author_id:
+            return True
+        if not interaction.response.is_done():
+            await interaction.response.send_message("Bu yardım menüsü sana ait değil.", ephemeral=True)
+        return False
+
+    def set_home(self) -> None:
+        self.state = "home"
+        self.active_category_key = None
+        self.active_entry = None
+        self.page_index = 0
+
+    def set_category(self, category_key: str) -> None:
+        self.state = "category"
+        self.active_category_key = category_key
+        self.active_entry = None
+        self.page_index = 0
+
+    def set_entry(self, entry: CommandEntry) -> None:
+        self.state = "detail"
+        self.active_category_key = entry.category_key
+        self.active_entry = entry
+        self.page_index = 0
+
+    def current_category(self) -> HelpCategory | None:
+        if not self.active_category_key:
+            return None
+        return self.registry.category(self.active_category_key)
+
+    def current_entries(self) -> list[CommandEntry]:
+        category = self.current_category()
+        if not category:
+            return []
+        start = self.page_index * PAGE_SIZE
+        end = start + PAGE_SIZE
+        return category.entries[start:end]
+
+    def _author_thumbnail(self) -> str | None:
+        user = getattr(self.bot, "user", None)
+        if user is None:
+            return None
+        return user.display_avatar.url
+
+    def _base_embed(self, *, title: str, description: str, key: str) -> discord.Embed:
+        embed = PAGEmbeds.custom(
+            title=title,
+            description=description,
+            color=CATEGORY_COLORS.get(key, discord.Colour.blurple()),
+            thumbnail_url=self._author_thumbnail(),
+            image_url=BANNER_URLS.get(key, BANNER_URLS["detail"]),
+        )
+        embed.timestamp = discord.utils.utcnow()
+        return embed
+
+    def _home_embed(self) -> discord.Embed:
+        total, prefix_only, slash_only, both = self.registry.list_stats()
+        categories_with_commands = [category for category in self.registry.categories if category.command_count > 0]
+
+        description = (
+            "Bu panel yalnızca projede gerçekten kayıtlı komutları gösterir.\n"
+            f"Prefix: `{self.registry.prefix}`\n"
+            "Bir kategori seçebilir veya `!help komut` şeklinde detay sayfası açabilirsin."
         )
 
-        view = HelpCategoryView(
-            bot=self.bot,
-            author_id=self.author_id,
+        embed = self._base_embed(title="⚔️ PAG Command Center", description=description, key="home")
+        embed.clear_fields()
+
+        summary_lines = [
+            f"• {category.emoji} **{category.title}** — `{category.command_count}` komut • örnek: {category.example_invocation(self.registry.prefix)}"
+            for category in categories_with_commands
+        ]
+        if summary_lines:
+            embed.add_field(
+                name="Kategoriler",
+                value="\n".join(summary_lines)[:1024],
+                inline=False,
+            )
+
+        embed.add_field(
+            name="Komut Özeti",
+            value=(
+                f"Toplam: `{total}`\n"
+                f"Prefix-only: `{prefix_only}`\n"
+                f"Slash-only: `{slash_only}`\n"
+                f"Hybrid: `{both}`"
+            ),
+            inline=True,
         )
 
-        await interaction.response.edit_message(
-            embed=embed,
-            view=view,
+        embed.add_field(
+            name="Kullanım",
+            value=(
+                f"`{self.registry.prefix}help`\n"
+                f"`{self.registry.prefix}help moderation`\n"
+                f"`{self.registry.prefix}help warn`"
+            ),
+            inline=True,
         )
 
-    # ========================================================
-    # CATEGORY EMBED
-    # ========================================================
+        embed.set_footer(text="Gerçek komutlar • Gerçek açıklamalar • Fake yok")
+        return embed
 
-    def _create_category_embed(
-        self,
-        category: str,
-    ) -> discord.Embed:
-        """
-        Seçilen kategori için embed oluşturur.
-        """
-
-        embed = discord.Embed(
-            color=PAG_COLOR,
+    def _category_embed(self, category: HelpCategory) -> discord.Embed:
+        start = self.page_index * PAGE_SIZE
+        end = start + PAGE_SIZE
+        entries = category.entries[start:end]
+        description = (
+            f"{category.description}\n"
+            f"Prefix: `{self.registry.prefix}`\n"
+            f"Sayfa: `{self.page_index + 1}/{category.page_count}`"
         )
 
-        if category == "profile":
+        embed = self._base_embed(title=f"{category.emoji} {category.title}", description=description, key=category.key)
+        embed.clear_fields()
 
-            embed.title = "👤 Profile & User"
-
-            embed.description = (
-                "Kullanıcı profil sistemleri."
-            )
-
+        if not entries:
             embed.add_field(
-                name="/profile",
-                value=(
-                    "Kullanıcı profilini görüntüler."
-                ),
+                name="Komutlar",
+                value="Bu kategoride görünür komut yok.",
                 inline=False,
             )
-
-            embed.add_field(
-                name="📊 Profil Sistemi",
-                value=(
-                    "Kullanıcı istatistikleri, "
-                    "bilgileri ve PAG verileri."
-                ),
-                inline=False,
-            )
-
-        elif category == "roblox":
-
-            embed.title = "🎮 Roblox & Verification"
-
-            embed.description = (
-                "Roblox bağlantısı ve doğrulama sistemleri."
-            )
-
-            embed.add_field(
-                name="/verify",
-                value=(
-                    "Discord hesabını Roblox hesabıyla doğrular."
-                ),
-                inline=False,
-            )
-
-            embed.add_field(
-                name="🔗 Roblox Services",
-                value=(
-                    "Roblox API tabanlı sistemler."
-                ),
-                inline=False,
-            )
-
-        elif category == "ranking":
-
-            embed.title = "🏆 Top 10 & Ranking"
-
-            embed.description = (
-                "PAG sıralama sistemleri."
-            )
-
-            embed.add_field(
-                name="🏆 Top 10",
-                value=(
-                    "Sunucunun en iyi oyuncularını görüntüler."
-                ),
-                inline=False,
-            )
-
-            embed.add_field(
-                name="📈 Ranking",
-                value=(
-                    "Oyuncu sıralaması ve istatistik sistemleri."
-                ),
-                inline=False,
-            )
-
-        elif category == "events":
-
-            embed.title = "🎉 Events"
-
-            embed.description = (
-                "PAG etkinlik sistemleri."
-            )
-
-            embed.add_field(
-                name="🎮 Event System",
-                value=(
-                    "Etkinlik oluşturma, katılım ve "
-                    "katılımcı yönetimi."
-                ),
-                inline=False,
-            )
-
-        elif category == "moderation":
-
-            embed.title = "🛡️ Moderation"
-
-            embed.description = (
-                "Sunucu güvenliği ve moderasyon araçları."
-            )
-
-            embed.add_field(
-                name="🚫 Blacklist",
-                value=(
-                    "Kullanıcı blacklist sistemi."
-                ),
-                inline=False,
-            )
-
-        elif category == "tools":
-
-            embed.title = "🔧 Server Tools"
-
-            embed.description = (
-                "Sunucu yönetimi için yardımcı araçlar."
-            )
-
-            embed.add_field(
-                name="📢 Say",
-                value=(
-                    "Bot üzerinden mesaj gönderme araçları."
-                ),
-                inline=False,
-            )
-
-            embed.add_field(
-                name="✍️ Write",
-                value=(
-                    "Mesaj ve yazı araçları."
-                ),
-                inline=False,
-            )
-
-            embed.add_field(
-                name="🎭 Role Info",
-                value=(
-                    "Rol bilgilerini görüntüleme."
-                ),
-                inline=False,
-            )
-
-        elif category == "system":
-
-            embed.title = "⚙️ System"
-
-            embed.description = (
-                "PAG Bot sistem bilgileri."
-            )
-
-            embed.add_field(
-                name="🤖 Bot Status",
-                value=(
-                    "PAG Bot aktiflik ve sistem durumu."
-                ),
-                inline=False,
-            )
-
         else:
+            for entry in entries:
+                forms = entry.forms_text(self.registry.prefix)
+                value_lines = [
+                    entry.short_description(),
+                    f"**Komut:** {forms}",
+                ]
+                if entry.aliases:
+                    value_lines.append(f"**Alias:** {entry.alias_text()}")
+                if entry.guild_only:
+                    value_lines.append("**Sunucu:** Sadece sunucuda kullanılabilir.")
+                embed.add_field(
+                    name=entry.display_name(),
+                    value="\n".join(value_lines)[:1024],
+                    inline=False,
+                )
 
-            embed.title = "📚 PAG Bot Help"
+        embed.set_footer(
+            text=f"Sayfa {self.page_index + 1}/{category.page_count} • {category.command_count} komut",
+        )
+        return embed
 
-            embed.description = (
-                "Kategori bulunamadı."
+    def _entry_embed(self, entry: CommandEntry) -> discord.Embed:
+        description = entry.short_description()
+        embed = self._base_embed(title=f"🔎 {entry.display_name()}", description=description, key=entry.category_key)
+        embed.clear_fields()
+
+        embed.add_field(
+            name="Komut Formları",
+            value="\n".join(entry.forms(self.registry.prefix)),
+            inline=False,
+        )
+
+        prefix_usage = entry.prefix_usage(self.registry.prefix)
+        slash_usage = entry.slash_usage()
+
+        if prefix_usage or slash_usage:
+            usage_value = "\n".join(
+                item for item in [prefix_usage, slash_usage] if item
+            )
+            embed.add_field(
+                name="Kullanım",
+                value=usage_value,
+                inline=False,
+            )
+
+        embed.add_field(
+            name="Kategori",
+            value=f"{CATEGORY_META.get(entry.category_key, {'title': entry.category_key}).get('title', entry.category_key)}",
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Kaynak",
+            value=entry.source_text(),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Sunucu İzni",
+            value=_humanize_bool(entry.guild_only),
+            inline=True,
+        )
+
+        embed.add_field(
+            name="Aliaslar",
+            value=entry.alias_text(),
+            inline=False,
+        )
+
+        if entry.module:
+            embed.add_field(
+                name="Modül",
+                value=f"`{entry.module}`",
+                inline=False,
             )
 
         embed.set_footer(
-            text=(
-                "PAG Bot • Help Center"
-            ),
+            text=f"Prefix: {self.registry.prefix} • Gerçek komut detayı",
         )
-
         return embed
 
+    def render(self) -> discord.Embed:
+        if self.state == "detail" and self.active_entry is not None:
+            return self._entry_embed(self.active_entry)
+        if self.state == "category":
+            category = self.current_category()
+            if category is not None:
+                return self._category_embed(category)
+        return self._home_embed()
 
-# ============================================================
-# CATEGORY VIEW
-# ============================================================
+    def _update_button_states(self) -> None:
+        category = self.current_category()
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                if child.custom_id == "help_home":
+                    child.disabled = self.state == "home"
+                elif child.custom_id == "help_prev":
+                    child.disabled = self.state != "category" or category is None or self.page_index <= 0
+                elif child.custom_id == "help_next":
+                    child.disabled = self.state != "category" or category is None or self.page_index >= category.page_count - 1
+                elif child.custom_id == "help_close":
+                    child.disabled = False
 
-class HelpCategoryView(
-    discord.ui.View,
-):
-    """
-    Kategori sayfası View'ı.
-    """
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        self._update_button_states()
+        await interaction.response.edit_message(embed=self.render(), view=self)
 
-    def __init__(
-        self,
-        bot: commands.Bot,
-        author_id: int,
-    ) -> None:
+    async def go_home(self, interaction: discord.Interaction) -> None:
+        self.set_home()
+        await self.refresh(interaction)
 
+    async def go_prev(self, interaction: discord.Interaction) -> None:
+        if self.state != "category":
+            return await interaction.response.send_message("Bu menüde sayfa yok.", ephemeral=True)
+        if self.page_index <= 0:
+            return
+        self.page_index -= 1
+        await self.refresh(interaction)
+
+    async def go_next(self, interaction: discord.Interaction) -> None:
+        category = self.current_category()
+        if self.state != "category" or category is None:
+            return await interaction.response.send_message("Bu menüde sayfa yok.", ephemeral=True)
+        if self.page_index >= category.page_count - 1:
+            return
+        self.page_index += 1
+        await self.refresh(interaction)
+
+    async def close(self, interaction: discord.Interaction) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Item):
+                item.disabled = True
+        await interaction.response.edit_message(embed=self.render(), view=self)
+        self.stop()
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            if isinstance(item, discord.ui.Item):
+                item.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except Exception:
+            pass
+
+
+class HelpHomeButton(discord.ui.Button):
+    def __init__(self, view: HelpView) -> None:
         super().__init__(
-            timeout=300,
+            label="Ana Sayfa",
+            style=discord.ButtonStyle.primary,
+            emoji="🏠",
+            custom_id="help_home",
+            row=1,
         )
+        self.view_ref = view
 
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view_ref.ensure_author(interaction):
+            return
+        await self.view_ref.go_home(interaction)
+
+
+class HelpPrevButton(discord.ui.Button):
+    def __init__(self, view: HelpView) -> None:
+        super().__init__(
+            label="Önceki",
+            style=discord.ButtonStyle.secondary,
+            emoji="⬅️",
+            custom_id="help_prev",
+            row=1,
+        )
+        self.view_ref = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view_ref.ensure_author(interaction):
+            return
+        await self.view_ref.go_prev(interaction)
+
+
+class HelpNextButton(discord.ui.Button):
+    def __init__(self, view: HelpView) -> None:
+        super().__init__(
+            label="Sonraki",
+            style=discord.ButtonStyle.secondary,
+            emoji="➡️",
+            custom_id="help_next",
+            row=1,
+        )
+        self.view_ref = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view_ref.ensure_author(interaction):
+            return
+        await self.view_ref.go_next(interaction)
+
+
+class HelpCloseButton(discord.ui.Button):
+    def __init__(self, view: HelpView) -> None:
+        super().__init__(
+            label="Kapat",
+            style=discord.ButtonStyle.danger,
+            emoji="✖️",
+            custom_id="help_close",
+            row=1,
+        )
+        self.view_ref = view
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.view_ref.ensure_author(interaction):
+            return
+        await self.view_ref.close(interaction)
+
+
+class HelpCog(commands.Cog):
+    def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.logger = getattr(bot, "logger", logging.getLogger("PAG.Help"))
 
-        self.author_id = author_id
+    def build_registry(self) -> HelpRegistry:
+        return HelpRegistry(self.bot)
 
-    # ========================================================
-    # HOME
-    # ========================================================
+    async def _send_panel(self, destination: Any, author_id: int, registry: HelpRegistry, *, entry: CommandEntry | None = None, category: HelpCategory | None = None) -> None:
+        view = HelpView(self.bot, author_id, registry)
+        view.add_item(HelpHomeButton(view))
+        view.add_item(HelpPrevButton(view))
+        view.add_item(HelpNextButton(view))
+        view.add_item(HelpCloseButton(view))
 
-    @discord.ui.button(
-        label="Ana Menü",
-        emoji="🏠",
-        style=discord.ButtonStyle.primary,
-    )
-    async def home_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button,
-    ) -> None:
+        if entry is not None:
+            view.set_entry(entry)
+        elif category is not None:
+            view.set_category(category.key)
+        else:
+            view.set_home()
 
-        if interaction.user.id != self.author_id:
+        view._update_button_states()
+        embed = view.render()
 
-            await interaction.response.send_message(
-                "❌ Bu paneli yalnızca açan kişi kullanabilir.",
-                ephemeral=True,
-            )
-
+        if isinstance(destination, discord.Interaction):
+            await destination.response.send_message(embed=embed, view=view)
+            message = await destination.original_response()
+            view.message = message
             return
 
-        cog = self.bot.get_cog(
-            "Help",
-        )
+        message = await destination.send(embed=embed, view=view)
+        view.message = message
 
-        if cog is None:
+    async def _send_query_result(self, destination: Any, query: str) -> None:
+        registry = self.build_registry()
+        normalized = query.strip()
 
-            await interaction.response.send_message(
-                "❌ Help sistemi kullanılamıyor.",
-                ephemeral=True,
-            )
-
+        entry = registry.entry(normalized)
+        if entry is not None:
+            await self._send_panel(destination, getattr(destination, "user", getattr(destination, "author", None)).id, registry, entry=entry)
             return
 
-        embed = cog._create_main_embed(
-            interaction,
+        category = registry.category_for_query(normalized)
+        if category is not None:
+            await self._send_panel(destination, getattr(destination, "user", getattr(destination, "author", None)).id, registry, category=category)
+            return
+
+        suggestions = registry.best_matches(normalized)
+
+        embed = PAGEmbeds.warning(
+            "Komut Bulunamadı",
+            (
+                f"`{normalized}` için eşleşen gerçek komut bulunamadı.\n"
+                f"Prefix: `{registry.prefix}`"
+            ),
         )
+        embed.set_thumbnail(url=self._author_thumbnail())
+        embed.set_image(url=BANNER_URLS["detail"])
+        if suggestions:
+            embed.add_field(
+                name="Öneriler",
+                value="\n".join(f"`{item}`" for item in suggestions[:5]),
+                inline=False,
+            )
+        embed.set_footer(text="Gerçek komutları görmek için kategori seçebilir veya doğru komut adını yazabilirsin.")
 
-        view = HelpView(
-            bot=self.bot,
-            author_id=self.author_id,
+        if isinstance(destination, discord.Interaction):
+            await destination.response.send_message(embed=embed, ephemeral=True)
+        else:
+            await destination.reply(embed=embed, mention_author=False)
+
+    def _author_thumbnail(self) -> str | None:
+        user = getattr(self.bot, "user", None)
+        if user is None:
+            return None
+        return user.display_avatar.url
+
+    @commands.command(name="help", aliases=("h", "commands"))
+    async def help_prefix(self, ctx: commands.Context, *, query: str | None = None) -> None:
+        registry = self.build_registry()
+
+        if not query:
+            await self._send_panel(ctx, ctx.author.id, registry)
+            return
+
+        normalized = query.strip()
+        entry = registry.entry(normalized)
+        if entry is not None:
+            await self._send_panel(ctx, ctx.author.id, registry, entry=entry)
+            return
+
+        category = registry.category_for_query(normalized)
+        if category is not None:
+            await self._send_panel(ctx, ctx.author.id, registry, category=category)
+            return
+
+        suggestions = registry.best_matches(normalized)
+
+        embed = PAGEmbeds.warning(
+            "Komut Bulunamadı",
+            (
+                f"`{normalized}` için eşleşen gerçek komut bulunamadı.\n"
+                f"Prefix: `{registry.prefix}`"
+            ),
         )
+        embed.set_thumbnail(url=self._author_thumbnail())
+        embed.set_image(url=BANNER_URLS["detail"])
 
-        await interaction.response.edit_message(
-            embed=embed,
-            view=view,
+        if suggestions:
+            embed.add_field(
+                name="Öneriler",
+                value="\n".join(f"`{item}`" for item in suggestions[:5]),
+                inline=False,
+            )
+
+        embed.set_footer(text="Gerçek komutları görmek için kategori seçebilir veya doğru komut adını yazabilirsin.")
+        await ctx.reply(embed=embed, mention_author=False)
+
+    @app_commands.command(name="help", description="PAG Bot yardım panelini açar.")
+    @app_commands.describe(query="Komut veya kategori adı.")
+    async def help_slash(self, interaction: discord.Interaction, query: str | None = None) -> None:
+        registry = self.build_registry()
+
+        if not query:
+            await self._send_panel(interaction, interaction.user.id, registry)
+            return
+
+        normalized = query.strip()
+        entry = registry.entry(normalized)
+        if entry is not None:
+            await self._send_panel(interaction, interaction.user.id, registry, entry=entry)
+            return
+
+        category = registry.category_for_query(normalized)
+        if category is not None:
+            await self._send_panel(interaction, interaction.user.id, registry, category=category)
+            return
+
+        suggestions = registry.best_matches(normalized)
+
+        embed = PAGEmbeds.warning(
+            "Komut Bulunamadı",
+            (
+                f"`{normalized}` için eşleşen gerçek komut bulunamadı.\n"
+                f"Prefix: `{registry.prefix}`"
+            ),
         )
+        embed.set_thumbnail(url=self._author_thumbnail())
+        embed.set_image(url=BANNER_URLS["detail"])
+
+        if suggestions:
+            embed.add_field(
+                name="Öneriler",
+                value="\n".join(f"`{item}`" for item in suggestions[:5]),
+                inline=False,
+            )
+
+        embed.set_footer(text="Gerçek komutları görmek için kategori seçebilir veya doğru komut adını yazabilirsin.")
+        await interaction.response.send_message(embed=embed)
 
 
-# ============================================================
-# SETUP
-# ============================================================
-
-async def setup(
-    bot: commands.Bot,
-) -> None:
-    """
-    Discord.py extension setup.
-    """
-
-    await bot.add_cog(
-        help(
-            bot,
-        )
-    )
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(HelpCog(bot))
