@@ -1123,7 +1123,7 @@ async def setup(
     """
 
     await bot.add_cog(
-        Help(
+        help(
             bot,
         )
     )
