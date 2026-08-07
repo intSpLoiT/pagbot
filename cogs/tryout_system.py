@@ -262,20 +262,39 @@ class TryoutSystemCog(commands.Cog):
     async def restore_active_views(self) -> None:
         if self._restoring_views:
             return
+
         self._restoring_views = True
+
         try:
             rows = await self.database.fetchall(
                 """
-                SELECT id
+                SELECT id, announcement_message_id
                 FROM tryout_sessions
-                WHERE status = 'open' AND announcement_message_id IS NOT NULL
+                WHERE status = 'open'
+                  AND announcement_message_id IS NOT NULL
                 """
             )
+
             for row in rows:
                 try:
-                    self.bot.add_view(TryoutAttendanceView(self, int(row["id"])), message_id=int(row["announcement_message_id"]))
+                    if "announcement_message_id" not in row.keys():
+                        continue
+
+                    message_id = row["announcement_message_id"]
+                    if message_id is None:
+                        continue
+
+                    self.bot.add_view(
+                        TryoutAttendanceView(self, int(row["id"])),
+                        message_id=int(message_id),
+                    )
+
                 except Exception:
-                    self.logger.exception("Failed to restore tryout view for session %s.", row["id"])
+                    self.logger.exception(
+                        "Failed to restore tryout view for session %s.",
+                        row["id"],
+                    )
+
         finally:
             self._restoring_views = False
 
