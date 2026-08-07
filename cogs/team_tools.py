@@ -80,6 +80,20 @@ def role_mention(guild: discord.Guild, role_id: Optional[int]) -> str:
     return role.mention if role else f"`{role_id}`"
 
 
+def find_role_by_name(guild: discord.Guild, raw: str) -> Optional[discord.Role]:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    for role in guild.roles:
+        if role.name.lower() == lowered:
+            return role
+    for role in guild.roles:
+        if lowered in role.name.lower():
+            return role
+    return None
+
+
 def resolve_role(guild: discord.Guild, value: str) -> Optional[discord.Role]:
     raw = (value or "").strip()
     if not raw:
@@ -181,6 +195,35 @@ class TeamToolsDB:
                     created_at TEXT NOT NULL,
                     UNIQUE(event_id, user_id),
                     FOREIGN KEY(event_id) REFERENCES train_events(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS teamer_help_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id INTEGER NOT NULL,
+                    host_id INTEGER NOT NULL,
+                    note_text TEXT NOT NULL,
+                    ping_role_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    created_at TEXT NOT NULL,
+                    message_id INTEGER,
+                    channel_id INTEGER
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS teamer_help_attendance (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id INTEGER NOT NULL,
+                    guild_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(event_id, user_id),
+                    FOREIGN KEY(event_id) REFERENCES teamer_help_events(id) ON DELETE CASCADE
                 )
                 """
             )
@@ -393,6 +436,71 @@ class TeamToolsDB:
         )
         return str(row["status"]) if row else None
 
+    async def create_teamer_help_event(
+        self,
+        guild_id: int,
+        host_id: int,
+        note_text: str,
+        ping_role_id: Optional[int],
+    ) -> int:
+        def _sync() -> int:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO teamer_help_events (
+                        guild_id, host_id, note_text, ping_role_id, status, created_at
+                    ) VALUES (?, ?, ?, ?, 'open', ?)
+                    """,
+                    (guild_id, host_id, note_text, ping_role_id, utc_now()),
+                )
+                conn.commit()
+                return int(cur.lastrowid)
+
+        return await self._run(_sync)
+
+    async def set_teamer_help_meta(self, event_id: int, message_id: int, channel_id: int) -> None:
+        await self.execute(
+            "UPDATE teamer_help_events SET message_id=?, channel_id=? WHERE id=?",
+            (message_id, channel_id, event_id),
+        )
+
+    async def get_teamer_help_event(self, event_id: int) -> Optional[dict[str, Any]]:
+        row = await self.fetchone("SELECT * FROM teamer_help_events WHERE id=?", (event_id,))
+        return dict(row) if row else None
+
+    async def get_teamer_help_counts(self, event_id: int) -> tuple[int, int]:
+        yes = await self.fetchone(
+            "SELECT COUNT(*) AS c FROM teamer_help_attendance WHERE event_id=? AND status='yes'",
+            (event_id,),
+        )
+        no = await self.fetchone(
+            "SELECT COUNT(*) AS c FROM teamer_help_attendance WHERE event_id=? AND status='no'",
+            (event_id,),
+        )
+        return int(yes["c"] if yes else 0), int(no["c"] if no else 0)
+
+    async def get_user_teamer_help_status(self, event_id: int, user_id: int) -> Optional[str]:
+        row = await self.fetchone(
+            "SELECT status FROM teamer_help_attendance WHERE event_id=? AND user_id=?",
+            (event_id, user_id),
+        )
+        return str(row["status"]) if row else None
+
+    async def set_teamer_help_attendance(self, event_id: int, guild_id: int, user_id: int, status: str) -> None:
+        await self.execute(
+            """
+            INSERT INTO teamer_help_attendance (event_id, guild_id, user_id, status, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(event_id, user_id) DO UPDATE SET
+                status=excluded.status,
+                created_at=excluded.created_at
+            """,
+            (event_id, guild_id, user_id, status, utc_now()),
+        )
+
+    async def set_teamer_help_status(self, event_id: int, status: str) -> None:
+        await self.execute("UPDATE teamer_help_events SET status=? WHERE id=?", (status, event_id))
+
 
 # ==========================================================
 # Views / modals
@@ -473,6 +581,10 @@ class TrainAttendanceView(discord.ui.View):
         if not event or event["status"] != "open":
             return await interaction.response.send_message("Bu train kapatılmış.", ephemeral=True)
 
+        current = await self.cog.db.get_user_train_status(self.event_id, interaction.user.id)
+        if current == status:
+            return await interaction.response.send_message("Zaten bu şekilde işaretlenmiş.", ephemeral=True)
+
         await self.cog.db.set_train_attendance(self.event_id, interaction.guild.id, interaction.user.id, status)
         await self.cog.db.add_audit(interaction.guild.id, interaction.user.id, f"train_{status}", f"event_id={self.event_id}")
 
@@ -488,6 +600,67 @@ class TrainAttendanceView(discord.ui.View):
     async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._update(interaction, "no")
 
+
+class TeamerHelpAttendanceView(discord.ui.View):
+    def __init__(self, cog: "TeamToolsCog", event_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.event_id = event_id
+
+    async def _update(self, interaction: discord.Interaction, status: str) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Sunucu içinde kullanılmalı.", ephemeral=True)
+
+        event = await self.cog.db.get_teamer_help_event(self.event_id)
+        if not event or event["status"] != "open":
+            return await interaction.response.send_message("Bu yardım çağrısı kapatılmış.", ephemeral=True)
+
+        current = await self.cog.db.get_user_teamer_help_status(self.event_id, interaction.user.id)
+        if current == status:
+            return await interaction.response.send_message("Zaten bu şekilde işaretlenmiş.", ephemeral=True)
+
+        await self.cog.db.set_teamer_help_attendance(self.event_id, interaction.guild.id, interaction.user.id, status)
+        await self.cog.db.add_audit(interaction.guild.id, interaction.user.id, f"teamer_help_{status}", f"event_id={self.event_id}")
+
+        await self.cog.refresh_teamer_help_message(interaction.guild, self.event_id)
+        text = "Katılımın işaretlendi." if status == "yes" else "Gelemeyeceğin işaretlendi."
+        await interaction.response.send_message(text, ephemeral=True)
+
+    @discord.ui.button(label="Katıldım", style=discord.ButtonStyle.success, emoji="✅")
+    async def yes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "yes")
+
+    @discord.ui.button(label="Katılmadım", style=discord.ButtonStyle.secondary, emoji="❌")
+    async def no(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._update(interaction, "no")
+
+
+class SparDecisionView(discord.ui.View):
+    def __init__(self, cog: "TeamToolsCog", request_id: int):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.request_id = request_id
+
+    async def _authorize(self, interaction: discord.Interaction) -> bool:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return False
+        panel = await self.cog.db.get_panel(interaction.guild.id)
+        role_id = panel.get("spar")
+        if role_id is None:
+            return is_manage_privileged(interaction.user)
+        return is_manage_privileged(interaction.user) or any(r.id == role_id for r in interaction.user.roles)
+
+    @discord.ui.button(label="Spar Kabul", style=discord.ButtonStyle.success, emoji="✅")
+    async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._authorize(interaction):
+            return await interaction.response.send_message("Bu işlem için yetkin yok.", ephemeral=True)
+        await self.cog.accept_spar(interaction, self.request_id)
+
+    @discord.ui.button(label="Spar Reddet", style=discord.ButtonStyle.danger, emoji="❌")
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._authorize(interaction):
+            return await interaction.response.send_message("Bu işlem için yetkin yok.", ephemeral=True)
+        await self.cog.reject_spar(interaction, self.request_id)
 
 class SparDecisionView(discord.ui.View):
     def __init__(self, cog: "TeamToolsCog", request_id: int):
@@ -548,6 +721,33 @@ class TeamToolsCog(commands.Cog):
         if not role_id:
             return False
         return any(r.id == role_id for r in member.roles)
+
+    async def _send_or_reply(self, target: commands.Context | discord.Interaction, content: str, *, ephemeral: bool = True) -> None:
+        if isinstance(target, discord.Interaction):
+            if target.response.is_done():
+                await target.followup.send(content, ephemeral=ephemeral)
+            else:
+                await target.response.send_message(content, ephemeral=ephemeral)
+            return
+        await target.reply(content, mention_author=False)
+
+    def _find_ping_role(self, guild: discord.Guild, preferred: str = "teamer-ping") -> Optional[discord.Role]:
+        role = resolve_role(guild, preferred)
+        if role:
+            return role
+        return find_role_by_name(guild, preferred)
+
+    async def _get_teamer_help_ping(self, guild: discord.Guild) -> str:
+        role = self._find_ping_role(guild, "teamer-ping")
+        if role:
+            return role.mention
+        panel = await self.db.get_panel(guild.id)
+        role_id = panel.get("teamer_help")
+        if role_id:
+            resolved = guild.get_role(role_id)
+            if resolved:
+                return resolved.mention
+        return "@everyone"
 
     async def _send_panel_embed(self, ctx: commands.Context) -> None:
         assert ctx.guild
@@ -660,8 +860,19 @@ class TeamToolsCog(commands.Cog):
 
     @commands.command(name="teamer", aliases=["teamer-help"])
     async def teamer(self, ctx: commands.Context) -> None:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            return
+
+        ping = await self._get_teamer_help_ping(ctx.guild)
+        teamer_ping_role = self._find_ping_role(ctx.guild, "teamer-ping")
+        event_id = await self.db.create_teamer_help_event(
+            ctx.guild.id,
+            ctx.author.id,
+            "Takım yardım isteği açıldı. Yardım edecek kişiler aşağıdaki butonlardan durumunu işaretlesin.",
+            teamer_ping_role.id if teamer_ping_role else None,
+        )
         embed = self._embed(
-            "Teamer Help",
+            f"Teamer Help #{event_id}",
             (
                 "Kısa yardım menüsü:\n\n"
                 "• `!spar-istek Rakip | Tarih | Saat | Not`\n"
@@ -669,20 +880,50 @@ class TeamToolsCog(commands.Cog):
                 "• `!spar-reddet <id>`\n"
                 "• `!spar-liste`\n"
                 "• `!spar-iptal <id>`\n\n"
-                "Train ve tryout duyuruları için paneldeki roller kullanılır."
+                "Birilerine ihtiyaç varsa durumunu butonlarla işaretle."
             ),
             discord.Color.green(),
         )
-        await ctx.send(embed=embed)
+        embed.add_field(name="Host", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Katıldım", value="0", inline=True)
+        embed.add_field(name="Katılmadım", value="0", inline=True)
+        message = await ctx.send(content=ping, embed=embed, view=TeamerHelpAttendanceView(self, event_id))
+        await self.db.set_teamer_help_meta(event_id, message.id, message.channel.id)
+        await self.db.add_audit(ctx.guild.id, ctx.author.id, "teamer_help_open", f"event_id={event_id}")
 
     @app_commands.command(name="teamer_help", description="Teamer yardım menüsünü gösterir.")
     async def teamer_help_slash(self, interaction: discord.Interaction) -> None:
+        if not interaction.guild or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message("Sadece sunucuda kullanılabilir.", ephemeral=True)
+
+        ping = await self._get_teamer_help_ping(interaction.guild)
+        teamer_ping_role = self._find_ping_role(interaction.guild, "teamer-ping")
+        event_id = await self.db.create_teamer_help_event(
+            interaction.guild.id,
+            interaction.user.id,
+            "Takım yardım isteği açıldı. Yardım edecek kişiler aşağıdaki butonlardan durumunu işaretlesin.",
+            teamer_ping_role.id if teamer_ping_role else None,
+        )
         embed = self._embed(
-            "Teamer Help",
-            "Prefix sürümü: `!teamer` / `!teamer-help`",
+            f"Teamer Help #{event_id}",
+            (
+                "Kısa yardım menüsü:\n\n"
+                "• `!spar-istek Rakip | Tarih | Saat | Not`\n"
+                "• `!spar-kabul <id>`\n"
+                "• `!spar-reddet <id>`\n"
+                "• `!spar-liste`\n"
+                "• `!spar-iptal <id>`\n\n"
+                "Butonlardan durum işaretlenebilir."
+            ),
             discord.Color.green(),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        embed.add_field(name="Host", value=interaction.user.mention, inline=True)
+        embed.add_field(name="Katıldım", value="0", inline=True)
+        embed.add_field(name="Katılmadım", value="0", inline=True)
+        await interaction.response.send_message(content=ping, embed=embed, view=TeamerHelpAttendanceView(self, event_id))
+        message = await interaction.original_response()
+        await self.db.set_teamer_help_meta(event_id, message.id, message.channel.id)
+        await self.db.add_audit(interaction.guild.id, interaction.user.id, "teamer_help_open", f"event_id={event_id}")
 
     # ------------------------------------------------------
     # Train announcement
@@ -745,6 +986,38 @@ class TeamToolsCog(commands.Cog):
 
         embed = self._train_embed(event_id, event["topic"], event["time_text"], event["note_text"], host, yes_count, no_count)
         await message.edit(embed=embed, view=TrainAttendanceView(self, event_id))
+
+    async def refresh_teamer_help_message(self, guild: discord.Guild, event_id: int) -> None:
+        event = await self.db.get_teamer_help_event(event_id)
+        if not event or not event.get("message_id") or not event.get("channel_id"):
+            return
+
+        channel = guild.get_channel(int(event["channel_id"]))
+        if not isinstance(channel, discord.TextChannel):
+            return
+
+        try:
+            message = await channel.fetch_message(int(event["message_id"]))
+        except Exception:
+            return
+
+        yes_count, no_count = await self.db.get_teamer_help_counts(event_id)
+        host = guild.get_member(int(event["host_id"])) if guild else None
+        if not isinstance(host, discord.Member):
+            host = guild.me if guild.me else None
+        if not isinstance(host, discord.Member):
+            return
+
+        ping = await self._get_teamer_help_ping(guild)
+        embed = self._embed(
+            f"Teamer Help #{event_id}",
+            clamp_text(event["note_text"] or "Takıma yardım gerekiyor.", 4096),
+            discord.Color.teal(),
+        )
+        embed.add_field(name="Host", value=host.mention, inline=True)
+        embed.add_field(name="Katıldım", value=str(yes_count), inline=True)
+        embed.add_field(name="Katılmadım", value=str(no_count), inline=True)
+        await message.edit(content=ping, embed=embed, view=TeamerHelpAttendanceView(self, event_id))
 
     # ------------------------------------------------------
     # Tryout announcement
