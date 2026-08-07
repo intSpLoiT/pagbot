@@ -389,17 +389,53 @@ class TryoutSystemCog(commands.Cog):
             reason="PAG tryout system setup",
         )
 
-    async def has_tryout_manage_access(self, guild: discord.Guild, member: discord.Member) -> bool:
-        if member.guild_permissions.administrator or member.guild_permissions.manage_guild or member.guild_permissions.manage_roles:
+    async def has_tryout_manage_access(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+    ) -> bool:
+        # Güçlü sunucu yetkileri
+        perms = member.guild_permissions
+        if (
+            perms.administrator
+            or perms.manage_guild
+            or perms.manage_roles
+            or perms.manage_channels
+            or perms.moderate_members
+        ):
             return True
+
+        # Veritabanında kayıtlı hoster rolü
         settings = await self.get_settings(guild.id)
         hoster_role_id = settings.get("hoster_role_id")
+
         if hoster_role_id:
             role = guild.get_role(int(hoster_role_id))
             if role and role in member.roles:
                 return True
-        role = discord.utils.get(guild.roles, name=HOSTER_ROLE_NAME)
-        return bool(role and role in member.roles)
+
+        # Esnek rol adı kontrolü
+        keywords = {
+            "hoster",
+            "tryout",
+            "trainer",
+            "evaluator",
+            "judge",
+            "staff",
+        }
+
+        for role in member.roles:
+            name = role.name.lower()
+
+            # Tam eşleşme
+            if name == HOSTER_ROLE_NAME.lower():
+                return True
+
+            # İçeriyorsa kabul et
+            if any(keyword in name for keyword in keywords):
+                return True
+
+        return False
 
     def _status_color(self, rating: str, stage: int, modifier: str | None) -> discord.Colour:
         base = stage_color(stage)
