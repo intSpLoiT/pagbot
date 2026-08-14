@@ -644,7 +644,17 @@ class Line(commands.Cog):
         await self.service.log(interaction.guild.id, interaction.user.id, "PANEL_CREATED", str(panel_message.id))
         await self.send_line_log(interaction.guild, interaction.user, "PANEL_CREATED", str(panel_message.id))
         await interaction.followup.send(f"✅ TSBCC Line Panel hazır: {panel_message.jump_url}", ephemeral=True)
+    # Prefix komutu (!line-panel)
+    @commands.command(name="line-panel")
+    @commands.guild_only()
+    async def line_panel_prefix(self, ctx: commands.Context):
+        """Kalıcı TSBCC Line Yönetim Paneli oluşturur."""
+        if not await self.has_line_manage_access(ctx.guild, ctx.author):
+            return await ctx.send("❌ Bu komutu kullanma yetkin yok.", delete_after=10)
 
+        # Slash komutuyla aynı panel oluşturma fonksiyonunu kullan
+        await self.create_line_panel(ctx.channel, ctx.guild, ctx.author)
+        await ctx.message.add_reaction("✅")
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Line(bot))
