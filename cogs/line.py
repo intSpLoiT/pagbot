@@ -89,6 +89,46 @@ class RemovePlayerSelect(discord.ui.Select):
         await interaction.response.edit_message(content=f"✅ Slot {slot} boşaltıldı.", embed=None, view=None)
 
 
+class MainCWLineSelect(discord.ui.Select):
+    def __init__(self, cog: "Line", rows: list[dict[str, Any]]) -> None:
+        self.cog = cog
+        options = [
+            discord.SelectOption(
+                label=f"Slot {row['slot']} • {row['roblox_username']}",
+                value=str(row['discord_id']),
+                description="Main Line oyuncusu",
+            )
+            for row in rows
+        ]
+        super().__init__(
+            placeholder="Main Line'dan CW oyuncularını seç…",
+            options=options,
+            min_values=1,
+            max_values=min(5, len(options)),
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if not await self.cog.guard_staff(interaction, require_unlocked=True):
+            return
+        main = await self.cog.service.get_line(interaction.guild.id, "main_line")
+        selected = {int(value) for value in self.values}
+        ordered = [row for row in main if int(row["discord_id"]) in selected]
+        players = [
+            {
+                "discord_id": int(row["discord_id"]),
+                "roblox_id": int(row["roblox_id"]),
+                "roblox_username": str(row["roblox_username"]),
+            }
+            for row in ordered
+        ]
+        await self.cog.service.set_line(interaction.guild.id, "cw_line", players)
+        details = ", ".join(p["roblox_username"] for p in players)
+        await self.cog.service.log(interaction.guild.id, interaction.user.id, "CW_LINE_SET_FROM_MAIN", details)
+        await self.cog.send_line_log(interaction.guild, interaction.user, "CW_LINE_SET_FROM_MAIN", details)
+        await self.cog.refresh_panel(interaction.guild)
+        await interaction.response.send_message("✅ Current CW Line Main Line'dan oluşturuldu.", ephemeral=True)
+
+
 class SetCWLineSelect(discord.ui.UserSelect):
     def __init__(self, cog: "Line") -> None:
         super().__init__(placeholder="Current CW Line oyuncularını seç…", min_values=1, max_values=5)
@@ -223,9 +263,13 @@ class LinePanelView(discord.ui.View):
     async def set_cw(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self.cog.guard_staff(interaction, require_unlocked=True):
             return
+        rows = await self.cog.service.get_line(interaction.guild.id, "main_line")
+        if not rows:
+            await interaction.response.send_message("❌ Önce Main Line'a oyuncu eklemelisin.", ephemeral=True)
+            return
         view = discord.ui.View(timeout=120)
-        view.add_item(SetCWLineSelect(self.cog))
-        await interaction.response.send_message("Current CW Line için en fazla 5 oyuncu seç:", view=view, ephemeral=True)
+        view.add_item(MainCWLineSelect(self.cog, rows))
+        await interaction.response.send_message("Current CW Line için Main Line oyuncularından seçim yap:", view=view, ephemeral=True)
 
     @discord.ui.button(label="Reset Line", style=discord.ButtonStyle.danger, emoji="♻️", custom_id="pag_line_reset")
     async def reset_line(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -597,6 +641,74 @@ class Line(commands.Cog):
             except discord.HTTPException as exc:
                 self.logger.warning("Failed to refresh line panel: %s", exc)
 
+    @app_commands.command(name="line", description="Aktif PAG TSBCC Main Line ve Current CW Line durumunu gösterir.")
+    @app_commands.guild_only()
+    async def line_status(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        main = await self.service.get_line(interaction.guild.id, "main_line")
+        cw = await self.service.get_line(interaction.guild.id, "cw_line")
+        settings = await self.service.get_settings(interaction.guild.id)
+        match = await self.service.get_match(interaction.guild.id)
+        embed = self.build_panel_embed(interaction.guild, main, cw, settings, match)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="line-watch", description="Canlı TSBCC Line panelini izlemeye başlar veya izlemeyi bırakır.")
+    @app_commands.guild_only()
+    async def line_watch(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return
+        watchers = self._watchers.setdefault(interaction.guild.id, set())
+        if interaction.user.id in watchers:
+            watchers.remove(interaction.user.id)
+            state = "izlemeyi bıraktın"
+        else:
+            watchers.add(interaction.user.id)
+            state = "canlı line'ı izlemeye başladın"
+        await self.refresh_panel(interaction.guild)
+        await interaction.response.send_message(f"👀 Artık {state}.", ephemeral=True)
+
+    @app_commands.command(name="line-apply", description="TSBCC Line'a katılım başvuru ekranını açar.")
+    @app_commands.guild_only()
+    async def line_apply(self, interaction: discord.Interaction) -> None:
+        await interaction.response.send_message(
+            embed=self.application_embed(),
+            view=ApplicationView(self),
+            ephemeral=True,
+        )
+
+    @commands.command(name="line", aliases=("linestatus",))
+    @commands.guild_only()
+    async def line_status_prefix(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            return
+        main = await self.service.get_line(ctx.guild.id, "main_line")
+        cw = await self.service.get_line(ctx.guild.id, "cw_line")
+        settings = await self.service.get_settings(ctx.guild.id)
+        match = await self.service.get_match(ctx.guild.id)
+        embed = self.build_panel_embed(ctx.guild, main, cw, settings, match)
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @commands.command(name="line-watch", aliases=("linewatch",))
+    @commands.guild_only()
+    async def line_watch_prefix(self, ctx: commands.Context) -> None:
+        if ctx.guild is None:
+            return
+        watchers = self._watchers.setdefault(ctx.guild.id, set())
+        if ctx.author.id in watchers:
+            watchers.remove(ctx.author.id)
+            state = "izlemeyi bıraktın"
+        else:
+            watchers.add(ctx.author.id)
+            state = "canlı line'ı izlemeye başladın"
+        await self.refresh_panel(ctx.guild)
+        await ctx.send(f"👀 {ctx.author.mention}, artık {state}.", allowed_mentions=discord.AllowedMentions(users=True))
+
+    @commands.command(name="line-apply", aliases=("lineapply",))
+    @commands.guild_only()
+    async def line_apply_prefix(self, ctx: commands.Context) -> None:
+        await ctx.send(embed=self.application_embed(), view=ApplicationView(self))
+
     @app_commands.command(name="line-panel", description="TSBCC Main Line / Current CW / Live Match panelini oluşturur veya yeniler.")
     @app_commands.guild_only()
     async def line_panel(self, interaction: discord.Interaction) -> None:
@@ -644,17 +756,58 @@ class Line(commands.Cog):
         await self.service.log(interaction.guild.id, interaction.user.id, "PANEL_CREATED", str(panel_message.id))
         await self.send_line_log(interaction.guild, interaction.user, "PANEL_CREATED", str(panel_message.id))
         await interaction.followup.send(f"✅ TSBCC Line Panel hazır: {panel_message.jump_url}", ephemeral=True)
-    # Prefix komutu (!line-panel)
-    @commands.command(name="line-panel")
-    @commands.guild_only()
-    async def line_panel_prefix(self, ctx: commands.Context):
-        """Kalıcı TSBCC Line Yönetim Paneli oluşturur."""
-        if not await self.has_line_manage_access(ctx.guild, ctx.author):
-            return await ctx.send("❌ Bu komutu kullanma yetkin yok.", delete_after=10)
 
-        # Slash komutuyla aynı panel oluşturma fonksiyonunu kullan
-        await self.create_line_panel(ctx.channel, ctx.guild, ctx.author)
-        await ctx.message.add_reaction("✅")
+    @commands.command(name="line-panel", aliases=("linepanel",))
+    @commands.guild_only()
+    async def line_panel_prefix(self, ctx: commands.Context) -> None:
+        if ctx.guild is None or not isinstance(ctx.author, discord.Member):
+            return
+        allowed = ctx.guild.owner_id == ctx.author.id or bool(
+            self.role_names(ctx.author) & LineConfig.STAFF_ROLES
+        )
+        if not allowed:
+            await ctx.send("❌ Bu paneli yönetme yetkin yok.", delete_after=6)
+            return
+        target = ctx.channel
+        if not isinstance(target, discord.TextChannel):
+            await ctx.send("❌ Panel yalnızca text channel içinde oluşturulabilir.", delete_after=6)
+            return
+        settings = await self.service.get_settings(ctx.guild.id)
+        main = await self.service.get_line(ctx.guild.id, "main_line")
+        cw = await self.service.get_line(ctx.guild.id, "cw_line")
+        match = await self.service.get_match(ctx.guild.id)
+        embed = self.build_panel_embed(ctx.guild, main, cw, settings, match)
+        view = LinePanelView(self)
+        panel_message = None
+        old_channel_id = settings.get("panel_channel_id")
+        old_message_id = settings.get("panel_message_id")
+        if old_channel_id == target.id and old_message_id:
+            try:
+                panel_message = await target.fetch_message(int(old_message_id))
+                await panel_message.edit(embed=embed, view=view)
+            except (discord.NotFound, discord.HTTPException, discord.Forbidden):
+                panel_message = None
+        if panel_message is None:
+            if LineConfig.GIF_PATH.exists():
+                file = discord.File(LineConfig.GIF_PATH, filename="pag.gif")
+                embed.set_image(url="attachment://pag.gif")
+                panel_message = await target.send(embed=embed, file=file, view=view)
+            else:
+                panel_message = await target.send(embed=embed, view=view)
+        log_channel = discord.utils.find(
+            lambda c: isinstance(c, discord.TextChannel) and c.name == LineConfig.LOG_CHANNEL_NAME,
+            ctx.guild.channels,
+        )
+        await self.service.upsert_settings(
+            ctx.guild.id,
+            panel_channel_id=target.id,
+            panel_message_id=panel_message.id,
+            log_channel_id=(log_channel.id if isinstance(log_channel, discord.TextChannel) else target.id),
+        )
+        await self.service.log(ctx.guild.id, ctx.author.id, "PANEL_CREATED", str(panel_message.id))
+        await self.send_line_log(ctx.guild, ctx.author, "PANEL_CREATED", str(panel_message.id))
+        await ctx.send(f"✅ TSBCC Line Panel hazır: {panel_message.jump_url}", delete_after=8)
+
 
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Line(bot))
