@@ -218,7 +218,28 @@ def component_to_dict(component: discord.Component) -> dict[str, Any]:
         ]
 
     return data
+# ========================================================
+# Discord.py compatibility helpers
+# ========================================================
 
+def _safe_channel_id(guild: discord.Guild, attr: str) -> int | None:
+    """
+    Discord.py sürüm farklarına karşı güvenli kanal ID erişimi.
+    Önce *_id alanını dener, yoksa kanal nesnesinden ID alır.
+    Hiçbiri yoksa None döndürür.
+    """
+
+    # Eski / farklı sürümler
+    direct = getattr(guild, f"{attr}_id", None)
+    if isinstance(direct, int):
+        return direct
+
+    # Discord.py 2.x
+    channel = getattr(guild, attr, None)
+    if channel is not None:
+        return getattr(channel, "id", None)
+
+    return None
 
 def embed_to_dict(embed: discord.Embed) -> dict[str, Any]:
     try:
@@ -623,12 +644,12 @@ class SecurityBackup(commands.Cog):
                 None,
             ),
             "afk_timeout": guild.afk_timeout,
-            "system_channel_id": guild.system_channel_id,
-            "rules_channel_id": guild.rules_channel_id,
-            "public_updates_channel_id": guild.public_updates_channel_id,
-            "afk_channel_id": guild.afk_channel_id,
-            "preferred_locale": str(guild.preferred_locale),
-            "features": list(guild.features),
+            "system_channel_id": _safe_channel_id(guild, "system_channel"),
+            "rules_channel_id": _safe_channel_id(guild, "rules_channel"),
+            "public_updates_channel_id": _safe_channel_id(guild, "public_updates_channel"),
+            "afk_channel_id": _safe_channel_id(guild, "afk_channel"),
+            "preferred_locale": str(getattr(guild, "preferred_locale", "en-US")),
+            "features": list(getattr(guild, "features", [])),
         }
 
     def serialize_role(
