@@ -8,13 +8,13 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Optional
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 
 # ============================================================
 # PAG BOT — RAID SYSTEM
 # ============================================================
+# All public commands are prefix commands beginning with !.
 # This cog intentionally uses the project's shared Database
 # (bot.database). It does NOT create another SQLite connection.
 # ============================================================
@@ -1294,8 +1294,6 @@ class Raid(commands.Cog):
     # PANEL
     # ========================================================
 
-    @app_commands.command(name="raidpanel", description="PAG Raid Center panelini gönderir.")
-    @app_commands.guild_only()
     async def raidpanel(self, interaction: discord.Interaction) -> None:
         if not await self.ensure_guild(interaction):
             return
@@ -1312,15 +1310,6 @@ class Raid(commands.Cog):
             archive_channels=bool((await self.get_config(interaction.guild.id))["archive_channels"]) if await self.get_config(interaction.guild.id) else True,
         )
 
-    @app_commands.command(name="raidsetup", description="Raid kanal/kategori ve manager ayarlarını yapar.")
-    @app_commands.guild_only()
-    @app_commands.describe(
-        board_channel="Raid Center'ın bulunacağı kanal",
-        category="Raid chat kategorisi",
-        manager_role="Raid Manager rolü",
-        staff_role="Staff rolü",
-        archive="Bitmiş raid kanallarını arşivle; false ise sil",
-    )
     async def raidsetup(
         self,
         interaction: discord.Interaction,
@@ -1882,8 +1871,6 @@ class Raid(commands.Cog):
                 ephemeral=True,
             )
 
-    @app_commands.command(name="raidreview", description="Bekleyen Raid reportlarını yönetir.")
-    @app_commands.guild_only()
     async def raidreview(self, interaction: discord.Interaction) -> None:
         if not await self.require_manager(interaction):
             return
@@ -1905,8 +1892,6 @@ class Raid(commands.Cog):
     # ADMIN / DIRECT COMMANDS
     # ========================================================
 
-    @app_commands.command(name="raidfinish", description="Bir Raid'i sonuçlandırır.")
-    @app_commands.guild_only()
     async def raidfinish(self, interaction: discord.Interaction, raid_id: int) -> None:
         if not await self.ensure_guild(interaction):
             return
@@ -1919,66 +1904,689 @@ class Raid(commands.Cog):
             return
         await interaction.response.send_modal(RaidResultModal(self, raid_id, interaction.user.id))
 
-    @app_commands.command(name="raidcancel", description="Bir Raid'i iptal eder.")
-    @app_commands.guild_only()
     async def raidcancel(self, interaction: discord.Interaction, raid_id: int) -> None:
         await self.cancel_raid_interaction(interaction, raid_id)
 
-    @app_commands.command(name="raidprofile", description="Bir oyuncunun Raid profilini gösterir.")
-    @app_commands.guild_only()
     async def raidprofile(self, interaction: discord.Interaction, member: discord.Member | None = None) -> None:
         await self.send_profile(interaction, (member or interaction.user).id)
 
-    @app_commands.command(name="raidactive", description="Aktif Raidleri gösterir.")
-    @app_commands.guild_only()
     async def raidactive(self, interaction: discord.Interaction) -> None:
         await self.send_active_raids(interaction)
 
     # ========================================================
-    # PREFIX COMMANDS
+    # PREFIX COMMANDS — ! ONLY
     # ========================================================
+
+    async def _prefix_send(self, ctx: commands.Context, *, embed: discord.Embed, delete_after: float | None = None):
+        try:
+            return await ctx.send(embed=embed, delete_after=delete_after)
+        except discord.HTTPException as exc:
+            self.logger.warning("Raid prefix send failed: %s", exc)
+            return None
+
+    async def _prefix_manager(self, ctx: commands.Context) -> bool:
+        if not ctx.guild or not isinstance(ctx.author, discord.Member):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Sunucu Komutu", "Bu komut yalnızca sunucuda kullanılabilir."))
+            return False
+        if await self.is_manager(ctx.author):
+            return True
+        await self._prefix_send(ctx, embed=RaidEmbeds.error("🛡️ Yetki Gerekli", "Bu işlem yalnızca Raid Manager / Staff / yetkili kullanıcılar tarafından kullanılabilir."))
+        return False
+
+    @commands.command(name="raidhelp", aliases=["raidcommands", "raidmenu"])
+    @commands.guild_only()
+    async def raidhelp_prefix(self, ctx: commands.Context) -> None:
+        embed = RaidEmbeds.info(
+            "⚔️ PAG RAID COMMAND CENTER",
+            "Tüm RAID işlemleri `!` prefix ile kullanılabilir. Buton paneli yardımcı arayüz olarak da kullanılabilir.",
+        )
+        embed.add_field(
+            name="👥 Üye Komutları",
+            value=(
+                "`!raidcreate RIVAL | Not` — Raid oluştur\n"
+                "`!raidjoin <id>` — Raid'e katıl\n"
+                "`!raidleave <id>` — Raid'den ayrıl\n"
+                "`!raidinvite <id> @üye` — Oyuncu davet et\n"
+                "`!raidaccept <invite_id>` / `!raiddecline <invite_id>` — Davet cevapla\n"
+                "`!raidactive` — Aktif Raidler\n"
+                "`!raidprofile [@üye]` — Profil\n"
+                "`!raidhistory [@üye]` — Geçmiş\n"
+                "`!raidreport ...` — Manuel Report\n"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🛡️ Raid Manager / Staff",
+            value=(
+                "`!raidpanel` — Raid Center gönder\n"
+                "`!raidsetup #kanal #kategori @manager [@staff] [archive]`\n"
+                "`!raidaddopponents <id> @a @b @c`\n"
+                "`!raidfinish <id> <win|loss|draw> [@mvp] <proof>`\n"
+                "`!raidcancel <id>`\n"
+                "`!raidreview` — Pending reportlar\n"
+                "`!raidreview <id> <verify|reject> [not]`\n"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🏆 İstatistik",
+            value="`!raidmvp` • `!raidranking` • `!raidprofile` • `!raidhistory`",
+            inline=False,
+        )
+        embed.add_field(
+            name="🧾 Manuel Report Formatı",
+            value=(
+                "`!raidreport RIVAL | 2026-08-20 | @P1 @P2 @P3 | win | @MVP | https://proof`\n"
+                "Proof Link **zorunlu**. Report önce `PENDING`, sonra staff doğrulamasıyla `VERIFIED` olur."
+            ),
+            inline=False,
+        )
+        embed.set_footer(text="PAG RAID SYSTEM • Prefix Mode • !raidhelp")
+        await self._prefix_send(ctx, embed=embed)
 
     @commands.command(name="raidpanel")
     @commands.guild_only()
-    @commands.has_guild_permissions(manage_guild=True)
     async def raidpanel_prefix(self, ctx: commands.Context) -> None:
-        await ctx.send(embed=RaidEmbeds.center(), view=RaidPanelView(self))
+        if not await self._prefix_manager(ctx):
+            return
+        config = await self.get_config(ctx.guild.id)
+        message = await ctx.send(embed=RaidEmbeds.center(), view=RaidPanelView(self))
+        await self.store.set_config(
+            ctx.guild.id,
+            board_channel_id=message.channel.id,
+            category_id=int(config["category_id"]) if config and config["category_id"] else None,
+            manager_role_id=int(config["manager_role_id"]) if config and config["manager_role_id"] else None,
+            staff_role_id=int(config["staff_role_id"]) if config and config["staff_role_id"] else None,
+            archive_channels=bool(config["archive_channels"]) if config else True,
+        )
+        self.logger.info("Raid panel sent in guild %s by %s", ctx.guild.id, ctx.author.id)
 
-    @commands.command(name="raidactive")
+    @commands.command(name="raidsetup")
+    @commands.guild_only()
+    @commands.has_permissions(manage_guild=True)
+    async def raidsetup_prefix(
+        self,
+        ctx: commands.Context,
+        board_channel: discord.TextChannel,
+        category: discord.CategoryChannel,
+        manager_role: discord.Role,
+        *options: str,
+    ) -> None:
+        if not await self._prefix_manager(ctx):
+            return
+        # Optional staff role + archive switch are deliberately parsed from the
+        # message instead of relying on fragile optional converters.
+        staff_role = None
+        mentioned_roles = [r for r in ctx.message.role_mentions if r.id != manager_role.id]
+        if mentioned_roles:
+            staff_role = mentioned_roles[0]
+        lowered = {str(option).casefold() for option in options}
+        archive_value = not bool(lowered & {"false", "0", "no", "off", "delete", "sil", "--delete"})
+        await self.store.set_config(
+            ctx.guild.id,
+            board_channel_id=board_channel.id,
+            category_id=category.id,
+            manager_role_id=manager_role.id,
+            staff_role_id=staff_role.id if staff_role else None,
+            archive_channels=archive_value,
+        )
+        await self._prefix_send(
+            ctx,
+            embed=RaidEmbeds.success(
+                "✅ Raid Setup Tamamlandı",
+                (
+                    f"**Board:** {board_channel.mention}\n"
+                    f"**Kategori:** `{category.name}`\n"
+                    f"**Manager:** {manager_role.mention}\n"
+                    f"**Staff:** {staff_role.mention if staff_role else 'Ayarlanmadı'}\n"
+                    f"**Bitince arşivle:** `{archive_value}`"
+                ),
+            ),
+        )
+
+    @commands.command(name="raidcreate", aliases=["createraid", "raidnew"])
+    @commands.guild_only()
+    async def raidcreate_prefix(self, ctx: commands.Context, *, raw: str = "") -> None:
+        opponent, sep, note = raw.partition("|")
+        opponent = clean_text(opponent, 80)
+        note = clean_text(note if sep else "", 500)
+        if not opponent:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Eksik Bilgi", "Kullanım: `!raidcreate RIVAL | isteğe bağlı not`"))
+            return
+        guild = ctx.guild
+        creator = ctx.author
+        lock = self.guild_lock(guild.id)
+        async with lock:
+            existing = await self.store.get_active_raids(guild.id)
+            if any(await self.store.is_player_in_raid(int(row["id"]), creator.id) for row in existing):
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Zaten Aktif Raid", "Aynı anda birden fazla Raid'e katılamazsın."))
+                return
+            raid_id = await self.store.create_raid(guild.id, creator.id, opponent, note)
+            await self.store.add_player(raid_id, guild.id, creator.id, "pag")
+            await self.store.audit(guild.id, creator.id, "raid_created", raid_id, details=opponent)
+            raid = await self.store.get_raid(raid_id, guild.id)
+            channel = await self.create_raid_channel(guild, raid_id, [creator.id])
+            if channel:
+                await self.store.update_raid_message(raid_id, channel.id, None)
+                raid = await self.store.get_raid(raid_id, guild.id)
+                pag = await self.store.get_player_ids(raid_id, "pag")
+                opp = await self.store.get_player_ids(raid_id, "opponent")
+                view = RaidActionView(self, raid_id, await self.is_manager(creator))
+                message = await channel.send(embed=RaidEmbeds.raid(raid, pag, opp, guild), view=view)
+                await self.store.update_raid_message(raid_id, channel.id, message.id)
+                try:
+                    self.bot.add_view(view, message_id=message.id)
+                except (discord.HTTPException, ValueError):
+                    pass
+            await self._prefix_send(
+                ctx,
+                embed=RaidEmbeds.success(
+                    "⚔️ Raid Oluşturuldu",
+                    f"**Raid:** `#{raid_id}`\n**Opponent:** `{opponent}`\n**Format:** `3v3`\n**Room:** {channel.mention if channel else 'oluşturulamadı'}",
+                ),
+            )
+
+    @commands.command(name="raidjoin", aliases=["joinraid"])
+    @commands.guild_only()
+    async def raidjoin_prefix(self, ctx: commands.Context, raid_id: int) -> None:
+        guild = ctx.guild
+        async with self.guild_lock(guild.id):
+            raid = await self.store.get_raid(raid_id, guild.id)
+            if not raid or raid["status"] not in {STATUS_RECRUITING, STATUS_ACTIVE}:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Bulunamadı", "Raid yok, kapalı veya artık katılıma açık değil."))
+                return
+            if await self.store.is_player_in_raid(raid_id, ctx.author.id):
+                await self._prefix_send(ctx, embed=RaidEmbeds.warning("ℹ️ Zaten İçeridesin", f"**#{raid_id}** Raid'inde zaten bulunuyorsun."))
+                return
+            for other in await self.store.get_active_raids(guild.id):
+                if int(other["id"]) != raid_id and await self.store.is_player_in_raid(int(other["id"]), ctx.author.id):
+                    await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Başka Raid'desin", f"Önce **#{other['id']}** Raid'inden ayrıl."))
+                    return
+            pag = await self.store.get_player_ids(raid_id, "pag")
+            if len(pag) >= TEAM_SIZE:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ PAG Takımı Dolu", "3/3 PAG slotu zaten dolu."))
+                return
+            await self.store.add_player(raid_id, guild.id, ctx.author.id, "pag")
+            await self.store.audit(guild.id, ctx.author.id, "raid_joined", raid_id)
+            await self.maybe_activate_raid(raid_id, guild)
+            raid = await self.store.get_raid(raid_id, guild.id)
+            await self.refresh_raid_message(raid_id, guild)
+            await self.sync_raid_channel_permissions(raid)
+            await self._prefix_send(ctx, embed=RaidEmbeds.success("✅ Raid'e Katıldın", f"**#{raid_id}** kadrosuna eklendin."))
+
+    @commands.command(name="raidleave", aliases=["leaveraid"])
+    @commands.guild_only()
+    async def raidleave_prefix(self, ctx: commands.Context, raid_id: int) -> None:
+        guild = ctx.guild
+        async with self.guild_lock(guild.id):
+            raid = await self.store.get_raid(raid_id, guild.id)
+            player = await self.store.is_player_in_raid(raid_id, ctx.author.id)
+            if not raid or not player or raid["status"] not in {STATUS_RECRUITING, STATUS_ACTIVE}:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Ayrılamadın", "Bu Raid'e kayıtlı değilsin veya Raid kapanmış."))
+                return
+            if int(raid["creator_id"]) == ctx.author.id and raid["status"] == STATUS_ACTIVE:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Host Ayrılamaz", "Aktif Raid hostu Raid'i bitirmeli veya yöneticiden destek almalı."))
+                return
+            await self.store.remove_player(raid_id, ctx.author.id)
+            if raid["status"] == STATUS_ACTIVE:
+                await self.store.update_status(raid_id, STATUS_RECRUITING)
+            await self.store.audit(guild.id, ctx.author.id, "raid_left", raid_id)
+            raid = await self.store.get_raid(raid_id, guild.id)
+            await self.refresh_raid_message(raid_id, guild)
+            await self.sync_raid_channel_permissions(raid)
+            await self._prefix_send(ctx, embed=RaidEmbeds.success("👋 Raid'den Ayrıldın", f"**#{raid_id}** kadrosundan çıkarıldın."))
+
+    @commands.command(name="raidinvite", aliases=["inviteRaid"])
+    @commands.guild_only()
+    async def raidinvite_prefix(self, ctx: commands.Context, raid_id: int, member: discord.Member) -> None:
+        guild = ctx.guild
+        raid = await self.store.get_raid(raid_id, guild.id)
+        if not raid or raid["status"] not in {STATUS_RECRUITING, STATUS_ACTIVE}:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Kapalı", "Bu Raid'e davet gönderilemez."))
+            return
+        if not isinstance(ctx.author, discord.Member):
+            return
+        if ctx.author.id != int(raid["creator_id"]) and not await self.is_manager(ctx.author):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("🛡️ Yetki Gerekli", "Davet göndermek için Raid hostu veya Manager olmalısın."))
+            return
+        # Direct prefix invite is equivalent to the interactive invitation flow.
+        if member.bot or member.id == ctx.author.id:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Geçersiz Oyuncu", "Bot veya kendin için Raid daveti gönderemezsin."))
+            return
+        if await self.store.is_player_in_raid(raid_id, member.id):
+            await self._prefix_send(ctx, embed=RaidEmbeds.warning("ℹ️ Zaten Kadroda", f"{member.mention} zaten Raid'de."))
+            return
+        pag = await self.store.get_player_ids(raid_id, "pag")
+        if len(pag) >= TEAM_SIZE:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ PAG Dolu", "3/3 PAG slotu dolu."))
+            return
+        active = await self.store.get_active_raids(guild.id)
+        for other in active:
+            if int(other["id"]) != raid_id and await self.store.is_player_in_raid(int(other["id"]), member.id):
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Oyuncu Meşgul", f"{member.mention} başka bir aktif Raid'de."))
+                return
+        await self.store.add_invite(raid_id, guild.id, ctx.author.id, member.id, "pag")
+        invite_row = await self.store.db.fetchone(
+            "SELECT id FROM raid_invites WHERE raid_id = ? AND invitee_id = ? LIMIT 1",
+            (raid_id, member.id),
+        )
+        if not invite_row:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Davet Hatası", "Raid daveti veritabanına kaydedilemedi."))
+            return
+        invite_id = int(invite_row["id"])
+        await self.store.audit(guild.id, ctx.author.id, "player_invited", raid_id, details=str(member.id))
+        try:
+            dm = await member.send(
+                embed=RaidEmbeds.info(
+                    f"📨 PAG Raid Daveti • #{raid_id}",
+                    f"**{short_text(raid['opponent_clan'], 80)}** Raid'ine davet edildin.\n\n**Invite ID:** `{invite_id}`\nButonları veya `!raidaccept {invite_id}` / `!raiddecline {invite_id}` komutlarını kullan.",
+                ),
+                view=InviteView(self, invite_id),
+            )
+        except discord.HTTPException:
+            dm = None
+        if dm is None:
+            await self._prefix_send(ctx, embed=RaidEmbeds.warning("⚠️ Davet Kaydedildi", f"{member.mention} için davet oluşturuldu ancak DM gönderilemedi. **Invite ID:** `{invite_id}`"))
+        else:
+            await self._prefix_send(ctx, embed=RaidEmbeds.success("📨 Davet Gönderildi", f"{member.mention} oyuncusuna **#{raid_id}** Raid daveti gönderildi."))
+
+    async def _prefix_respond_invite(self, ctx: commands.Context, invite_id: int, accept: bool) -> None:
+        invite = await self.store.get_invite(invite_id)
+        if not invite:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Davet Bulunamadı", f"Invite **#{invite_id}** bulunamadı."))
+            return
+        if int(invite["invitee_id"]) != ctx.author.id:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("🛡️ Yetki", "Bu davet sana ait değil."))
+            return
+        if invite["status"] != "pending":
+            await self._prefix_send(ctx, embed=RaidEmbeds.warning("ℹ️ Davet Kullanılmış", f"Invite **#{invite_id}** zaten `{invite['status']}` durumda."))
+            return
+        guild = ctx.guild
+        async with self.guild_lock(guild.id):
+            raid = await self.store.get_raid(int(invite["raid_id"]), guild.id)
+            if not raid or raid["status"] not in {STATUS_RECRUITING, STATUS_ACTIVE}:
+                await self.store.set_invite_status(invite_id, "expired")
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Kapalı", "Bu Raid artık aktif değil."))
+                return
+            if not accept:
+                await self.store.set_invite_status(invite_id, "declined")
+                await self.store.audit(guild.id, ctx.author.id, "invite_declined", int(invite["raid_id"]), details=str(invite_id))
+                await self._prefix_send(ctx, embed=RaidEmbeds.warning("❌ Davet Reddedildi", f"Invite **#{invite_id}** reddedildi."))
+                return
+            if await self.store.is_player_in_raid(int(invite["raid_id"]), ctx.author.id):
+                await self.store.set_invite_status(invite_id, "accepted")
+                await self._prefix_send(ctx, embed=RaidEmbeds.warning("ℹ️ Zaten Kadroda", "Bu Raid'de zaten bulunuyorsun."))
+                return
+            for other in await self.store.get_active_raids(guild.id):
+                if int(other["id"]) != int(invite["raid_id"]) and await self.store.is_player_in_raid(int(other["id"]), ctx.author.id):
+                    await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Başka Raid'desin", f"Önce **#{other['id']}** Raid'inden ayrıl."))
+                    return
+            pag = await self.store.get_player_ids(int(invite["raid_id"]), "pag")
+            if len(pag) >= TEAM_SIZE:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ PAG Dolu", "PAG tarafı 3/3 dolu."))
+                return
+            await self.store.add_player(int(invite["raid_id"]), guild.id, ctx.author.id, "pag")
+            await self.store.set_invite_status(invite_id, "accepted")
+            await self.store.audit(guild.id, ctx.author.id, "invite_accepted", int(invite["raid_id"]), details=str(invite_id))
+            await self.maybe_activate_raid(int(invite["raid_id"]), guild)
+            raid = await self.store.get_raid(int(invite["raid_id"]), guild.id)
+            await self.refresh_raid_message(int(invite["raid_id"]), guild)
+            await self.sync_raid_channel_permissions(raid)
+        await self._prefix_send(ctx, embed=RaidEmbeds.success("✅ Davet Kabul Edildi", f"**#{invite['raid_id']}** Raid'ine katıldın."))
+
+    @commands.command(name="raidaccept", aliases=["acceptraid", "raidacceptinvite"])
+    @commands.guild_only()
+    async def raidaccept_prefix(self, ctx: commands.Context, invite_id: int) -> None:
+        await self._prefix_respond_invite(ctx, invite_id, True)
+
+    @commands.command(name="raiddecline", aliases=["declineraid", "raiddeclineinvite"])
+    @commands.guild_only()
+    async def raiddecline_prefix(self, ctx: commands.Context, invite_id: int) -> None:
+        await self._prefix_respond_invite(ctx, invite_id, False)
+
+    @commands.command(name="raidaddopponents", aliases=["raidadv", "raidrival"])
+    @commands.guild_only()
+    async def raidaddopponents_prefix(self, ctx: commands.Context, raid_id: int, *members: discord.Member) -> None:
+        if not await self._prefix_manager(ctx):
+            return
+        if not members or len(members) > TEAM_SIZE:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Geçersiz Kadro", "1–3 rakip oyuncu ekleyebilirsin."))
+            return
+        guild = ctx.guild
+        async with self.guild_lock(guild.id):
+            raid = await self.store.get_raid(raid_id, guild.id)
+            if not raid or raid["status"] not in {STATUS_RECRUITING, STATUS_ACTIVE}:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Kapalı", "Raid artık kadro düzenlemeye açık değil."))
+                return
+            current = await self.store.get_player_ids(raid_id, "opponent")
+            added = 0
+            skipped: list[str] = []
+            for member in members:
+                if member.bot or member.id in current or await self.store.is_player_in_raid(raid_id, member.id):
+                    skipped.append(member.mention)
+                    continue
+                if len(current) + added >= TEAM_SIZE:
+                    skipped.append(member.mention)
+                    continue
+                await self.store.add_player(raid_id, guild.id, member.id, "opponent")
+                added += 1
+            if not added:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Oyuncu Eklenemedi", "Eklenebilecek geçerli rakip oyuncu bulunamadı."))
+                return
+            await self.maybe_activate_raid(raid_id, guild)
+            raid = await self.store.get_raid(raid_id, guild.id)
+            await self.refresh_raid_message(raid_id, guild)
+            await self.sync_raid_channel_permissions(raid)
+            await self.store.audit(guild.id, ctx.author.id, "rival_players_added", raid_id, details=",".join(str(m.id) for m in members))
+            desc = f"**{added}** rakip oyuncu eklendi."
+            if skipped:
+                desc += f"\nAtlanan: {', '.join(skipped)}"
+            await self._prefix_send(ctx, embed=RaidEmbeds.success("⚔️ Rival Kadrosu Güncellendi", desc))
+
+    @commands.command(name="raidfinish", aliases=["finishraid"])
+    @commands.guild_only()
+    async def raidfinish_prefix(self, ctx: commands.Context, raid_id: int, result_raw: str, *args: str) -> None:
+        # Syntax: !raidfinish <id> <win|loss|draw> [@mvp] <proof-url>
+        if not args:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Proof Zorunlu", "Kullanım: `!raidfinish <id> <win|loss|draw> [@mvp] <proof>`"))
+            return
+        proof_url = str(args[-1]).strip()
+        mvp = None
+        if len(args) > 1:
+            mentioned = list(ctx.message.mentions)
+            if mentioned:
+                mvp = mentioned[0]
+            else:
+                maybe_ids = extract_user_ids(" ".join(args[:-1]))
+                if maybe_ids:
+                    mvp = guild_member = ctx.guild.get_member(maybe_ids[0])
+        result = {
+            "win": RESULT_PAG_WIN,
+            "victory": RESULT_PAG_WIN,
+            "pagwin": RESULT_PAG_WIN,
+            "loss": RESULT_PAG_LOSS,
+            "defeat": RESULT_PAG_LOSS,
+            "pagloss": RESULT_PAG_LOSS,
+            "draw": RESULT_DRAW,
+        }.get(result_raw.casefold())
+        if not result:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Sonuç Geçersiz", "`win`, `loss` veya `draw` kullan."))
+            return
+        if not re.match(r"^https?://\S+$", proof_url.strip()):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Proof Zorunlu", "Geçerli bir HTTP(S) proof linki vermelisin."))
+            return
+        guild = ctx.guild
+        raid = await self.store.get_raid(raid_id, guild.id)
+        if not raid:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Bulunamadı", "Raid bulunamadı."))
+            return
+        if ctx.author.id != int(raid["creator_id"]) and not await self.is_manager(ctx.author):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("🛡️ Yetki Gerekli", "Raid'i yalnızca host veya Raid Manager bitirebilir."))
+            return
+        if mvp and mvp.bot:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ MVP Geçersiz", "Bot MVP olamaz."))
+            return
+        # Directly perform the persistence flow to avoid fabricating a Discord Interaction.
+        async with self.guild_lock(guild.id):
+            raid = await self.store.get_raid(raid_id, guild.id)
+            if not raid or raid["status"] not in {STATUS_ACTIVE, STATUS_RECRUITING}:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Bitirilemez", "Bu Raid kapanmış veya bulunamadı."))
+                return
+            pag = await self.store.get_player_ids(raid_id, "pag")
+            opp = await self.store.get_player_ids(raid_id, "opponent")
+            if not pag:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Oyuncu Yok", "Raid'de en az bir PAG oyuncusu olmalı."))
+                return
+            if mvp and mvp.id not in pag:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ MVP Geçersiz", "MVP PAG kadrosunda olmalı."))
+                return
+            if len(pag) < TEAM_SIZE or len(opp) < TEAM_SIZE:
+                if not await self.is_manager(ctx.author):
+                    await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ 3v3 Tamamlanmadı", "3v3 tamamlanmadan yalnızca Raid Manager/Staff Raid'i bitirebilir."))
+                    return
+            await self.store.finish_raid(raid_id, result, mvp.id if mvp else None, utc_now(), ctx.author.id, proof_url.strip())
+            for user_id in pag:
+                await self.store.apply_verified_stat(guild.id, user_id, result, user_id == (mvp.id if mvp else None))
+            await self.store.audit(guild.id, ctx.author.id, "raid_verified_completed", raid_id, details=result)
+            raid = await self.store.get_raid(raid_id, guild.id)
+            await self.refresh_raid_message(raid_id, guild)
+            await self.archive_or_delete_channel(raid)
+        await self._prefix_send(ctx, embed=RaidEmbeds.success("🏁 Raid Tamamlandı", f"**#{raid_id}** → **{result_label(result)}**\nMVP: {mvp.mention if mvp else 'Seçilmedi'}\n🔗 Proof: {proof_url.strip()}"))
+
+    @commands.command(name="raidcancel", aliases=["cancelraid"])
+    @commands.guild_only()
+    async def raidcancel_prefix(self, ctx: commands.Context, raid_id: int) -> None:
+        if not await self._prefix_manager(ctx):
+            return
+        guild = ctx.guild
+        async with self.guild_lock(guild.id):
+            raid = await self.store.get_raid(raid_id, guild.id)
+            if not raid or raid["status"] in {STATUS_COMPLETED, STATUS_CANCELLED}:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Kapalı", "Bu Raid zaten kapanmış."))
+                return
+            await self.store.cancel_raid(raid_id)
+            await self.store.audit(guild.id, ctx.author.id, "raid_cancelled", raid_id)
+            raid = await self.store.get_raid(raid_id, guild.id)
+            await self.refresh_raid_message(raid_id, guild)
+            await self.archive_or_delete_channel(raid)
+        await self._prefix_send(ctx, embed=RaidEmbeds.success("🔴 Raid İptal Edildi", f"Raid **#{raid_id}** iptal edildi."))
+
+    @commands.command(name="raidactive", aliases=["activeRaids"])
     @commands.guild_only()
     async def raidactive_prefix(self, ctx: commands.Context) -> None:
         rows = await self.store.get_active_raids(ctx.guild.id)
         if not rows:
-            await ctx.send(embed=RaidEmbeds.info("⚔️ Active Raids", "Açık Raid yok."))
+            await self._prefix_send(ctx, embed=RaidEmbeds.info("⚔️ Active Raids", "Şu anda açık Raid yok."))
             return
         for row in rows[:10]:
             pag = await self.store.get_player_ids(int(row["id"]), "pag")
             opp = await self.store.get_player_ids(int(row["id"]), "opponent")
             await ctx.send(embed=RaidEmbeds.raid(row, pag, opp, ctx.guild), view=RaidActionView(self, int(row["id"])))
 
+    @commands.command(name="raidmvp", aliases=["mvpranking", "raidmvprank"])
+    @commands.guild_only()
+    async def raidmvp_prefix(self, ctx: commands.Context) -> None:
+        rows = await self.store.rankings(ctx.guild.id, "mvp")
+        if not rows:
+            await self._prefix_send(ctx, embed=RaidEmbeds.info("🏆 MVP RANKING", "Henüz doğrulanmış MVP istatistiği yok."))
+            return
+        lines = [f"**#{i}** {user_mention(int(row['user_id']))} — ★ `{int(row['mvp'])}` MVP" for i, row in enumerate(rows, 1)]
+        await self._prefix_send(ctx, embed=RaidEmbeds.info("🏆 MVP RANKING", "\n".join(lines)))
+
+    @commands.command(name="raidranking", aliases=["raidrank", "rankingraid"])
+    @commands.guild_only()
+    async def raidranking_prefix(self, ctx: commands.Context) -> None:
+        rows = await self.store.rankings(ctx.guild.id, "wins")
+        if not rows:
+            await self._prefix_send(ctx, embed=RaidEmbeds.info("📊 RAID RANKING", "Henüz doğrulanmış Raid istatistiği yok."))
+            return
+        lines = [f"**#{i}** {user_mention(int(row['user_id']))} — `{int(row['wins'])} W • {int(row['losses'])} L` • `{int(row['raids'])} Raid`" for i, row in enumerate(rows, 1)]
+        await self._prefix_send(ctx, embed=RaidEmbeds.info("📊 RAID RANKING", "\n".join(lines)))
+
+    @commands.command(name="raidprofile", aliases=["raidstats", "mystatsraid"])
+    @commands.guild_only()
+    async def raidprofile_prefix(self, ctx: commands.Context, member: discord.Member | None = None) -> None:
+        target = member or ctx.author
+        stats = await self.store.get_stats(ctx.guild.id, target.id)
+        await self._prefix_send(ctx, embed=RaidEmbeds.profile(target.id, stats))
+
+    @commands.command(name="raidhistory", aliases=["raidlog", "raidrecords"])
+    @commands.guild_only()
+    async def raidhistory_prefix(self, ctx: commands.Context, member: discord.Member | None = None) -> None:
+        target = member or ctx.author
+        rows = await self.store.get_recent_raids(ctx.guild.id, target.id, 10)
+        if not rows:
+            await self._prefix_send(ctx, embed=RaidEmbeds.info("📜 RAID HISTORY", f"{target.mention} için Raid geçmişi yok."))
+            return
+        lines=[]
+        for row in rows:
+            date = parse_iso(row["ended_at"] or row["created_at"])
+            stamp = f"<t:{int(date.timestamp())}:d>" if date else "—"
+            lines.append(f"**#{row['id']}** • `{result_label(row['result']) if row['result'] else status_label(row['status'])}` • **{short_text(row['opponent_clan'], 40)}** • {stamp}")
+        embed = RaidEmbeds.info("📜 RAID HISTORY", "\n".join(lines))
+        embed.set_footer(text=f"Oyuncu: {target.display_name}")
+        await self._prefix_send(ctx, embed=embed)
+
+    @commands.command(name="raidreport", aliases=["reportraid"])
+    @commands.guild_only()
+    async def raidreport_prefix(self, ctx: commands.Context, *, raw: str = "") -> None:
+        parts = [part.strip() for part in raw.split("|")]
+        if len(parts) != 6:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("📝 RAID REPORT", "Kullanım:\n`!raidreport RIVAL | YYYY-MM-DD | @P1 @P2 @P3 | win | @MVP | https://proof`"))
+            return
+        opponent, raid_date, players_raw, result_raw, mvp_raw, proof_url = parts
+        result = {
+            "win": RESULT_PAG_WIN,
+            "victory": RESULT_PAG_WIN,
+            "pag win": RESULT_PAG_WIN,
+            "loss": RESULT_PAG_LOSS,
+            "defeat": RESULT_PAG_LOSS,
+            "pag loss": RESULT_PAG_LOSS,
+            "draw": RESULT_DRAW,
+        }.get(result_raw.casefold())
+        if not result:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Result", "Result `win`, `loss` veya `draw` olmalı."))
+            return
+        ids = extract_user_ids(players_raw)
+        mvp_ids = extract_user_ids(mvp_raw)
+        mvp_id = mvp_ids[0] if mvp_ids else None
+        if not ids or len(ids) > TEAM_SIZE:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Players", "1–3 PAG oyuncusu girmelisin."))
+            return
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", raid_date):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Tarih", "Tarih `YYYY-MM-DD` formatında olmalı."))
+            return
+        if not re.match(r"^https?://\S+$", proof_url):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("🔗 Proof Zorunlu", "Geçerli bir HTTP(S) Proof Linki vermelisin."))
+            return
+        if ctx.author.id not in ids:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Reporter", "Report gönderen kişi Players listesinde olmalı."))
+            return
+        if mvp_id and mvp_id not in ids:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ MVP", "MVP Players listesinde olmalı."))
+            return
+        for user_id in ids:
+            member = ctx.guild.get_member(user_id)
+            if not member or member.bot:
+                await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Oyuncu", f"Oyuncu sunucuda bulunamadı: `{user_id}`"))
+                return
+        duplicate = await self.database.fetchone(
+            "SELECT id FROM raid_reports WHERE guild_id = ? AND proof_url = ? AND status != 'rejected' LIMIT 1",
+            (ctx.guild.id, proof_url),
+        )
+        live_duplicate = await self.database.fetchone(
+            "SELECT id FROM raids WHERE guild_id = ? AND proof_url = ? AND status = 'completed' LIMIT 1",
+            (ctx.guild.id, proof_url),
+        )
+        if duplicate or live_duplicate:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("♻️ Duplicate Proof", "Bu Proof Link daha önce kullanılmış."))
+            return
+        report_id = await self.store.create_report(ctx.guild.id, ctx.author.id, clean_text(opponent, 80), ids, result, mvp_id, raid_date, proof_url)
+        await self.store.audit(ctx.guild.id, ctx.author.id, "report_created", report_id=report_id, details=proof_url)
+        await self.notify_pending_report(ctx.guild, report_id)
+        await self._prefix_send(ctx, embed=RaidEmbeds.success("📝 Report PENDING", f"Report **#{report_id}** alındı. Staff/Raid Manager doğrulamasını bekliyor.\n\n🔗 {proof_url}"))
+
+    @commands.command(name="raidreview", aliases=["reviewraid"])
+    @commands.guild_only()
+    async def raidreview_prefix(self, ctx: commands.Context, report_id: int | None = None, action: str | None = None, *, note: str = "") -> None:
+        if not await self._prefix_manager(ctx):
+            return
+        if report_id is None:
+            rows = await self.store.get_pending_reports(ctx.guild.id, 10)
+            if not rows:
+                await self._prefix_send(ctx, embed=RaidEmbeds.info("🛡️ RAID REVIEW", "Bekleyen report yok."))
+                return
+            lines = [f"**#{row['id']}** • {user_mention(int(row['reporter_id']))} • **{short_text(row['opponent_clan'], 50)}** • `{result_label(row['result'])}`\n🔗 {row['proof_url']}" for row in rows]
+            await self._prefix_send(ctx, embed=RaidEmbeds.warning("🛡️ RAID REVIEW QUEUE", "\n\n".join(lines)))
+            return
+        if action not in {"verify", "verified", "approve", "reject", "rejected"}:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Review Action", "Kullanım: `!raidreview <report_id> <verify|reject> [not]`"))
+            return
+        report = await self.store.get_report(report_id, ctx.guild.id)
+        if not report:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Report Bulunamadı", f"Report **#{report_id}** bulunamadı."))
+            return
+        if report["status"] != REPORT_PENDING:
+            await self._prefix_send(ctx, embed=RaidEmbeds.warning("ℹ️ Zaten İncelendi", f"Report şu anda `{report['status']}` durumunda."))
+            return
+        approve = action in {"verify", "verified", "approve"}
+        if not approve:
+            await self.store.review_report(report_id, REPORT_REJECTED, ctx.author.id, note or "Staff tarafından reddedildi.")
+            await self.store.audit(ctx.guild.id, ctx.author.id, "report_rejected", report_id=report_id, details=note)
+            await self._prefix_send(ctx, embed=RaidEmbeds.warning("❌ Report REJECTED", f"Report **#{report_id}** reddedildi."))
+            return
+        try:
+            players = [int(value) for value in json.loads(report["players_json"])]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Bozuk Report", "Players verisi geçersiz olduğu için güvenlik amacıyla onaylanmadı."))
+            return
+        if not players or len(players) > TEAM_SIZE:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Players", "Report oyuncu listesi geçersiz."))
+            return
+        if report["mvp_id"] and int(report["mvp_id"]) not in players:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ MVP", "Report MVP verisi oyuncu listesinde değil."))
+            return
+        async with self.guild_lock(ctx.guild.id):
+            # Re-read under lock to prevent two staff members from applying the same stats.
+            fresh = await self.store.get_report(report_id, ctx.guild.id)
+            if not fresh or fresh["status"] != REPORT_PENDING:
+                await self._prefix_send(ctx, embed=RaidEmbeds.warning("⚠️ Yarış Durumu", "Bu report başka bir yetkili tarafından zaten işlendi."))
+                return
+            await self.store.review_report(report_id, REPORT_VERIFIED, ctx.author.id, note or "Verified")
+            for user_id in players:
+                await self.store.apply_verified_stat(ctx.guild.id, user_id, fresh["result"], int(fresh["mvp_id"] or 0) == user_id)
+            await self.store.audit(ctx.guild.id, ctx.author.id, "report_verified", report_id=report_id, details=note)
+        await self._prefix_send(ctx, embed=RaidEmbeds.success("✅ Report VERIFIED", f"Report **#{report_id}** doğrulandı ve **{len(players)}** oyuncunun istatistiğine işlendi."))
+
+    @commands.command(name="raidinfo", aliases=["raidstatus", "raidshow"])
+    @commands.guild_only()
+    async def raidinfo_prefix(self, ctx: commands.Context, raid_id: int) -> None:
+        raid = await self.store.get_raid(raid_id, ctx.guild.id)
+        if not raid:
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Raid Bulunamadı", f"`#{raid_id}` bulunamadı."))
+            return
+        pag = await self.store.get_player_ids(raid_id, "pag")
+        opp = await self.store.get_player_ids(raid_id, "opponent")
+        await self._prefix_send(ctx, embed=RaidEmbeds.raid(raid, pag, opp, ctx.guild), delete_after=None)
+
     # ========================================================
-    # ERROR HANDLING
+    # Prefix command error handling
     # ========================================================
 
-    async def cog_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    @raidhelp_prefix.error
+    @raidpanel_prefix.error
+    @raidsetup_prefix.error
+    @raidcreate_prefix.error
+    @raidjoin_prefix.error
+    @raidleave_prefix.error
+    @raidinvite_prefix.error
+    @raidaccept_prefix.error
+    @raiddecline_prefix.error
+    @raidaddopponents_prefix.error
+    @raidfinish_prefix.error
+    @raidcancel_prefix.error
+    @raidactive_prefix.error
+    @raidmvp_prefix.error
+    @raidranking_prefix.error
+    @raidprofile_prefix.error
+    @raidhistory_prefix.error
+    @raidreport_prefix.error
+    @raidreview_prefix.error
+    @raidinfo_prefix.error
+    async def raid_prefix_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
         original = getattr(error, "original", error)
-        if isinstance(original, discord.Forbidden):
-            message = "Discord bu işlem için gerekli yetkiyi vermedi."
-        elif isinstance(original, discord.HTTPException):
-            message = "Discord API işlemi başarısız oldu. Biraz sonra tekrar dene."
-        elif isinstance(original, (ValueError, TypeError)):
-            message = "Girilen veriler geçersiz."
+        if isinstance(original, commands.MissingRequiredArgument):
+            message = f"Eksik parametre: `{original.param.name}`. `!raidhelp` ile kullanım örneklerini görebilirsin."
+        elif isinstance(original, commands.BadArgument):
+            message = "Parametre geçersiz. Mention/ID/komut formatını kontrol et. `!raidhelp` yaz."
+        elif isinstance(original, commands.MissingPermissions):
+            message = "Bu komut için gerekli Discord yetkisine sahip değilsin."
+        elif isinstance(original, commands.CheckFailure):
+            message = "Bu komut bu kanalda veya bu kullanıcı için kullanılamıyor."
         else:
-            self.logger.exception("Raid app command error: %s", original)
-            message = "Raid sistemi beklenmeyen bir hata verdi. Hata loglandı."
-        await self.safe_interaction_error(interaction, message)
-
-
-# ============================================================
-# REVIEW VIEWS
-# ============================================================
-
-
+            self.logger.exception("Raid prefix command error", exc_info=original)
+            message = "RAID sistemi beklenmeyen bir hata verdi. Hata loglandı."
+        await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ RAID COMMAND ERROR", message))
 class RaidReportReviewButton(discord.ui.Button):
     def __init__(self, cog: Raid, report_id: int, approve: bool) -> None:
         self.cog = cog
