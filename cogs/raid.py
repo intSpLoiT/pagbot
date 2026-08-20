@@ -1044,7 +1044,7 @@ class RaidActionButton(discord.ui.Button):
             "join": ("JOIN", discord.ButtonStyle.success),
             "leave": ("LEAVE", discord.ButtonStyle.secondary),
             "invite": ("INVITE", discord.ButtonStyle.primary),
-            "rivals": ("CALL RIVAL", discord.ButtonStyle.secondary),
+            "rivals": ("CALL PLAYER", discord.ButtonStyle.secondary),
             "finish": ("FINISH", discord.ButtonStyle.success),
             "cancel": ("CANCEL", discord.ButtonStyle.danger),
         }
@@ -1943,7 +1943,7 @@ class Raid(commands.Cog):
         embed.add_field(
             name="👥 Üye Komutları",
             value=(
-                "`!raidcreate RIVAL | Not` — Raid oluştur\n"
+                "`!raidcreate clan | Not` — Raid oluştur\n"
                 "`!raidjoin <id>` — Raid'e katıl\n"
                 "`!raidleave <id>` — Raid'den ayrıl\n"
                 "`!raidinvite <id> @üye` — Oyuncu davet et\n"
@@ -2051,7 +2051,7 @@ class Raid(commands.Cog):
         opponent = clean_text(opponent, 80)
         note = clean_text(note if sep else "", 500)
         if not opponent:
-            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Eksik Bilgi", "Kullanım: `!raidcreate RIVAL | isteğe bağlı not`"))
+            await self._prefix_send(ctx, embed=RaidEmbeds.error("❌ Eksik Bilgi", "Kullanım: `!raidcreate clan | isteğe bağlı not`"))
             return
         guild = ctx.guild
         creator = ctx.author
