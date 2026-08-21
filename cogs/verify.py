@@ -36,7 +36,7 @@ class VerifyConfig:
 
     VERIFIED_ROLE_NAME = "Verified"
 
-    VERIFIED_CHANNEL_NAME = "‽verified"
+    VERIFIED_CHANNEL_NAME = "│-ᐅ-verified"
 
     NOTIFICATION_USERNAME = "velgrath_"
 
