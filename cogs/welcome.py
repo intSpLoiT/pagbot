@@ -53,8 +53,8 @@ from discord.ext import commands
 # ÜSTÂD VELGRATH 🔱:
 # Buraya kendi GIF yollarını vereceksin.
 
-WELCOME_GIF_PATH = "BURAYA_GIRIS_GIF_YOLU"
-LEAVE_GIF_PATH = "BURAYA_CIKIS_GIF_YOLU"
+WELCOME_GIF_PATH = "gifs/welcome.gif"
+LEAVE_GIF_PATH = "gifs/welcome.gof"
 
 
 # ============================================================
