@@ -54,7 +54,7 @@ from discord.ext import commands
 # Buraya kendi GIF yollarını vereceksin.
 
 WELCOME_GIF_PATH = "gifs/welcome.gif"
-LEAVE_GIF_PATH = "gifs/welcome.gof"
+LEAVE_GIF_PATH = "gifs/welcome.gif"
 
 
 # ============================================================
