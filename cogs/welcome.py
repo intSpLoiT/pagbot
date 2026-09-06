@@ -75,24 +75,7 @@ DEFAULT_LEAVE_MESSAGE = (
     "**{username}** sunucudan ayrıldı.\n\n"
     "PAG ailesindeki yerin her zaman hatırlanacak."
 )
-file = self._make_file(
-    gif_path,
-)
 
-embed = self._build_welcome_embed(
-    member,
-    config,
-    gif_filename=(
-        file.filename
-        if file
-        else None
-    ),
-)
-
-await channel.send(
-    embed=embed,
-    file=file,
-)
 
 # ============================================================
 # COLORS
