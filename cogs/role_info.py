@@ -583,12 +583,15 @@ class RoleCategorySelect(discord.ui.Select):
             if not items:
                 continue
             title, fallback_emoji, _, _ = CATEGORY_META[category]
-            emoji = view.category_emojis.get(category) or fallback_emoji
+            # Discord component select options are intentionally kept on
+            # Unicode emoji. Custom guild emojis are still used in embeds,
+            # but can be rejected by Discord's component validator when the
+            # bot cannot use that expression in the current context.
             options.append(
                 discord.SelectOption(
                     label=title,
                     value=category,
-                    emoji=emoji,
+                    emoji=fallback_emoji,
                     description=f"Browse {len(items)} active role(s).",
                 )
             )
@@ -902,7 +905,7 @@ class RoleInfoView(discord.ui.View):
 
     @discord.ui.button(
         label="Overview",
-        emoji="⌂",
+        emoji="🏠",
         style=discord.ButtonStyle.primary,
         custom_id="pag_role_overview",
         row=1,
@@ -919,7 +922,7 @@ class RoleInfoView(discord.ui.View):
 
     @discord.ui.button(
         label="Close",
-        emoji="✕",
+        emoji="❌",
         style=discord.ButtonStyle.danger,
         custom_id="pag_role_close",
         row=1,
@@ -1069,7 +1072,7 @@ class RoleMembersView(discord.ui.View):
             self.refresh_controls()
             await interaction.response.edit_message(embed=self.create_embed(), view=self)
 
-    @discord.ui.button(label="Close", emoji="✕", style=discord.ButtonStyle.danger, custom_id="pag_rolemembers_close", row=0)
+    @discord.ui.button(label="Close", emoji="❌", style=discord.ButtonStyle.danger, custom_id="pag_rolemembers_close", row=0)
     async def close_button(
         self,
         interaction: discord.Interaction,
