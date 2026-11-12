@@ -25,6 +25,9 @@ Design guarantees
 * Views have finite lifetimes, bounded pages and error handlers.
 * Slash commands are registered in the PAG guild configured by
   ``DISCORD_GUILD_ID``; this matches PAGBot's guild-only sync strategy.
+* The three category GIFs keep their original filenames and are uploaded as
+  animated custom guild emojis on first use. Uploaded emojis are reused after
+  restarts; failed uploads fall back to Unicode without breaking commands.
 * No database, environment mutation or additional third-party package is
   required. discord.py and the Python standard library are sufficient.
 
@@ -33,6 +36,11 @@ Important
 The bot's Members intent must be enabled in both code and the Discord Developer
 Portal. PAGBot already enables ``intents.members``. If Discord does not permit
 member chunking, displayed counts are explicitly marked as cache-based.
+
+For animated category emojis, grant the bot Manage Expressions (Manage Emojis)
+and ensure the guild has an available animated emoji slot. Each source GIF is
+128x128 and below Discord's 256 KiB per-emoji upload limit. If these conditions
+are not met, the panel remains operational and displays Unicode fallbacks.
 
 Role descriptions explain intended PAG responsibilities. They do not grant,
 verify or imply Discord permissions; the server's actual role configuration
@@ -100,11 +108,21 @@ CATEGORY_META: Final[dict[str, tuple[str, str, str, discord.Color]]] = {
     ),
 }
 
+# Source GIF filenames are intentionally stable. They are optimized 128x128
+# animated emoji assets and are uploaded to the PAG guild on first use.
 BANNER_FILES: Final[dict[str, str]] = {
     "leadership": "roleinfo_leadership.gif",
     "security": "roleinfo_security.gif",
     "community": "roleinfo_community.gif",
 }
+
+CATEGORY_EMOJI_NAMES: Final[dict[str, str]] = {
+    "leadership": "pag_role_leadership",
+    "security": "pag_role_security",
+    "community": "pag_role_community",
+}
+
+MAX_DISCORD_EMOJI_BYTES: Final[int] = 256 * 1024
 
 
 # ============================================================================
@@ -537,17 +555,6 @@ def _cache_status(snapshot: RoleSnapshot) -> str:
     )
 
 
-def _new_banner_file(category: str) -> discord.File | None:
-    filename = BANNER_FILES.get(category)
-    if not filename:
-        return None
-    path = ASSET_DIR / filename
-    if not path.is_file():
-        LOGGER.warning("Role banner asset is missing: %s", path)
-        return None
-    return discord.File(path, filename=filename)
-
-
 def _category_for(records: Iterable[RoleRecord], role_id: int) -> tuple[str | None, int]:
     for category in CATEGORY_ORDER:
         category_records = [
@@ -575,7 +582,8 @@ class RoleCategorySelect(discord.ui.Select):
             items = view.roles_by_category.get(category, ())
             if not items:
                 continue
-            title, emoji, _, _ = CATEGORY_META[category]
+            title, fallback_emoji, _, _ = CATEGORY_META[category]
+            emoji = view.category_emojis.get(category) or fallback_emoji
             options.append(
                 discord.SelectOption(
                     label=title,
@@ -622,10 +630,12 @@ class RoleInfoView(discord.ui.View):
         owner_id: int,
         snapshot: RoleSnapshot,
         initial_role_id: int | None = None,
+        category_emojis: dict[str, discord.Emoji] | None = None,
     ) -> None:
         super().__init__(timeout=ROLE_VIEW_TIMEOUT_SECONDS)
         self.owner_id = owner_id
         self.snapshot = snapshot
+        self.category_emojis = dict(category_emojis or {})
         self.roles_by_category: dict[str, list[RoleRecord]] = defaultdict(list)
         for record in snapshot.records:
             self.roles_by_category[record.definition.category].append(record)
@@ -668,9 +678,16 @@ class RoleInfoView(discord.ui.View):
         self.page = max(0, min(self.page, len(records) - 1))
         return records[self.page]
 
-    @property
-    def banner_category(self) -> str:
-        return self.active_category or "leadership"
+    def category_emoji(self, category: str) -> discord.Emoji | str:
+        """Return the uploaded animated emoji, or the Unicode fallback."""
+        custom_emoji = self.category_emojis.get(category)
+        if custom_emoji is not None:
+            return custom_emoji
+        return CATEGORY_META[category][1]
+
+    def category_emoji_text(self, category: str) -> str:
+        """Return Discord's renderable custom-emoji token or Unicode fallback."""
+        return str(self.category_emoji(category))
 
     def refresh_controls(self) -> None:
         records = self.current_roles
@@ -689,15 +706,10 @@ class RoleInfoView(discord.ui.View):
             return self._create_overview_embed()
         return self._create_role_embed(self.current_record)
 
-    def _set_banner(self, embed: discord.Embed) -> None:
-        filename = BANNER_FILES.get(self.banner_category)
-        if filename and (ASSET_DIR / filename).is_file():
-            embed.set_image(url=f"attachment://{filename}")
-
     def _create_overview_embed(self) -> discord.Embed:
         snapshot = self.snapshot
         embed = discord.Embed(
-            title="PAG  •  ROLE INTELLIGENCE",
+            title=f"{self.category_emoji_text('leadership')}  PAG  •  ROLE INTELLIGENCE",
             description=(
                 "**Official role directory**\n"
                 "A curated overview of PAG leadership, security and community roles.\n\n"
@@ -725,7 +737,8 @@ class RoleInfoView(discord.ui.View):
             records = self.roles_by_category.get(category, [])
             if not records:
                 continue
-            title, emoji, summary, _ = CATEGORY_META[category]
+            title, _fallback_emoji, summary, _ = CATEGORY_META[category]
+            emoji = self.category_emoji_text(category)
             lines = [
                 f"{record.definition.emoji} **{_escape_role_name(record.role)}** · `{record.member_count:,}`"
                 for record in records[:ROLES_PER_CATEGORY_PREVIEW]
@@ -751,19 +764,20 @@ class RoleInfoView(discord.ui.View):
             )
 
         cache_note = _cache_status(snapshot)
-        embed.set_footer(text=f"PAG CORE  •  ROLE INTELLIGENCE  •  {cache_note}")
+        emoji_note = f"Animated division emojis: {len(self.category_emojis)}/3"
+        embed.set_footer(text=f"PAG CORE  •  ROLE INTELLIGENCE  •  {cache_note}  •  {emoji_note}")
         embed.timestamp = discord.utils.utcnow()
-        self._set_banner(embed)
         return embed
 
     def _create_role_embed(self, record: RoleRecord) -> discord.Embed:
         role = record.role
         definition = record.definition
-        category_title, category_emoji, _, category_color = CATEGORY_META[definition.category]
+        category_title, _fallback_emoji, _, category_color = CATEGORY_META[definition.category]
+        category_emoji = self.category_emoji_text(definition.category)
         embed_color = role.color if role.color.value else category_color
 
         embed = discord.Embed(
-            title=f"{definition.emoji}  {definition.title}",
+            title=f"{category_emoji}  {definition.emoji}  {definition.title}",
             description=(
                 f"{role.mention}\n\n"
                 f"{definition.description}\n\n"
@@ -793,25 +807,20 @@ class RoleInfoView(discord.ui.View):
         embed.set_footer(
             text=(
                 f"PAG CORE  •  {category_title.upper()}  •  "
-                f"{self.page + 1} OF {len(self.current_roles)}  •  {_cache_status(self.snapshot)}"
+                f"{self.page + 1} OF {len(self.current_roles)}  •  {_cache_status(self.snapshot)}  •  "
+                f"Animated emojis: {len(self.category_emojis)}/3"
             )
         )
         embed.timestamp = discord.utils.utcnow()
-        self._set_banner(embed)
         return embed
 
     async def _edit(self, interaction: discord.Interaction) -> None:
         self.refresh_controls()
-        embed = self.create_embed()
-        banner = _new_banner_file(self.banner_category)
-        try:
-            kwargs: dict[str, object] = {"embed": embed, "view": self}
-            if banner is not None:
-                kwargs["attachments"] = [banner]
-            await interaction.response.edit_message(**kwargs)
-        finally:
-            if banner is not None:
-                banner.close()
+        await interaction.response.edit_message(
+            embed=self.create_embed(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     async def change_category(self, interaction: discord.Interaction, category: str) -> None:
         if category not in CATEGORY_ORDER or not self.roles_by_category.get(category):
@@ -1082,6 +1091,9 @@ class RoleInfoCog(commands.Cog):
         bot_logger = getattr(bot, "logger", None)
         self.logger = bot_logger if isinstance(bot_logger, logging.Logger) else LOGGER
         self.analyzer = RoleAnalyzer(self.logger)
+        self._category_emoji_cache: dict[int, dict[str, discord.Emoji]] = {}
+        self._emoji_upload_attempted: set[int] = set()
+        self._emoji_upload_lock = asyncio.Lock()
 
     async def _collect(
         self,
@@ -1101,6 +1113,127 @@ class RoleInfoCog(commands.Cog):
             None,
         )
 
+    async def _ensure_category_emojis(
+        self,
+        guild: discord.Guild,
+    ) -> dict[str, discord.Emoji]:
+        """Create or reuse PAG's three animated role-category emojis.
+
+        Upload is lazy because the extension loader can run before the bot has
+        a connected guild cache. Upload errors never block role commands:
+        Unicode emoji remain as a safe fallback.
+        """
+        guild_id = guild.id
+        cached = self._category_emoji_cache.get(guild_id)
+        if cached is not None:
+            return cached
+
+        async with self._emoji_upload_lock:
+            cached = self._category_emoji_cache.get(guild_id)
+            if cached is not None:
+                return cached
+
+            existing = {emoji.name: emoji for emoji in guild.emojis}
+            result: dict[str, discord.Emoji] = {}
+            for category, emoji_name in CATEGORY_EMOJI_NAMES.items():
+                emoji = existing.get(emoji_name)
+                if emoji is not None:
+                    result[category] = emoji
+
+            missing = [
+                (category, emoji_name)
+                for category, emoji_name in CATEGORY_EMOJI_NAMES.items()
+                if category not in result
+            ]
+
+            # Do not repeat failed uploads on every command invocation.
+            if missing and guild_id not in self._emoji_upload_attempted:
+                self._emoji_upload_attempted.add(guild_id)
+                bot_member = guild.me
+                permissions = bot_member.guild_permissions if bot_member else None
+                can_manage = bool(
+                    permissions is not None
+                    and (permissions.manage_emojis or permissions.administrator)
+                )
+
+                if not can_manage:
+                    self.logger.warning(
+                        "Cannot upload PAG animated role emojis in guild %s: "
+                        "bot requires Manage Expressions / Manage Emojis. "
+                        "Unicode fallbacks will be used.",
+                        guild_id,
+                    )
+                else:
+                    for category, emoji_name in missing:
+                        filename = BANNER_FILES[category]
+                        asset_path = ASSET_DIR / filename
+                        if not asset_path.is_file():
+                            self.logger.error(
+                                "PAG role emoji source GIF is missing: %s",
+                                asset_path,
+                            )
+                            continue
+
+                        try:
+                            image_data = asset_path.read_bytes()
+                        except OSError:
+                            self.logger.exception(
+                                "Unable to read PAG role emoji source GIF: %s",
+                                asset_path,
+                            )
+                            continue
+
+                        if len(image_data) > MAX_DISCORD_EMOJI_BYTES:
+                            self.logger.error(
+                                "PAG role emoji %s is %s bytes; Discord's upload limit is %s bytes.",
+                                emoji_name,
+                                len(image_data),
+                                MAX_DISCORD_EMOJI_BYTES,
+                            )
+                            continue
+
+                        try:
+                            emoji = await guild.create_custom_emoji(
+                                name=emoji_name,
+                                image=image_data,
+                                reason="PAG Role Intelligence animated category emoji",
+                            )
+                        except discord.Forbidden:
+                            self.logger.warning(
+                                "Discord denied creation of PAG emoji %s in guild %s. "
+                                "Check Manage Expressions permission and animated emoji slots.",
+                                emoji_name,
+                                guild_id,
+                            )
+                            break
+                        except discord.HTTPException as error:
+                            self.logger.warning(
+                                "Discord rejected PAG emoji %s in guild %s: %s. "
+                                "Unicode fallback will be used for this category.",
+                                emoji_name,
+                                guild_id,
+                                error,
+                            )
+                            continue
+                        except Exception:
+                            self.logger.exception(
+                                "Unexpected error while creating PAG emoji %s in guild %s.",
+                                emoji_name,
+                                guild_id,
+                            )
+                            continue
+
+                        result[category] = emoji
+                        self.logger.info(
+                            "Uploaded PAG animated role emoji :%s: (%s) to guild %s.",
+                            emoji.name,
+                            emoji.id,
+                            guild_id,
+                        )
+
+            self._category_emoji_cache[guild_id] = result
+            return result
+
     async def _send_panel(
         self,
         destination: commands.Context | discord.Interaction,
@@ -1109,35 +1242,31 @@ class RoleInfoCog(commands.Cog):
         snapshot: RoleSnapshot,
         initial_role: discord.Role | None = None,
     ) -> None:
+        guild = destination.guild
+        category_emojis = (
+            await self._ensure_category_emojis(guild)
+            if guild is not None
+            else {}
+        )
         view = RoleInfoView(
             owner_id=owner_id,
             snapshot=snapshot,
             initial_role_id=initial_role.id if initial_role else None,
+            category_emojis=category_emojis,
         )
-        banner = _new_banner_file(view.banner_category)
-        try:
-            if isinstance(destination, discord.Interaction):
-                kwargs: dict[str, object] = {
-                    "embed": view.create_embed(),
-                    "view": view,
-                    "allowed_mentions": discord.AllowedMentions.none(),
-                }
-                if banner is not None:
-                    kwargs["attachments"] = [banner]
-                message = await destination.edit_original_response(**kwargs)
-            else:
-                kwargs = {
-                    "embed": view.create_embed(),
-                    "view": view,
-                    "allowed_mentions": discord.AllowedMentions.none(),
-                }
-                if banner is not None:
-                    kwargs["file"] = banner
-                message = await destination.send(**kwargs)
-            view.message = message
-        finally:
-            if banner is not None:
-                banner.close()
+        if isinstance(destination, discord.Interaction):
+            message = await destination.edit_original_response(
+                embed=view.create_embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            message = await destination.send(
+                embed=view.create_embed(),
+                view=view,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        view.message = message
 
     async def _validate_official_role(
         self,
@@ -1203,9 +1332,12 @@ class RoleInfoCog(commands.Cog):
         members_view.message = message
 
     @staticmethod
-    def _stats_embed(snapshot: RoleSnapshot) -> discord.Embed:
+    def _stats_embed(
+        snapshot: RoleSnapshot,
+        category_emojis: dict[str, discord.Emoji] | None = None,
+    ) -> discord.Embed:
         embed = discord.Embed(
-            title="PAG  •  ROLE STATISTICS",
+            title=f"{str((category_emojis or {}).get('leadership', '👑'))}  PAG  •  ROLE STATISTICS",
             description="Live breakdown of active, recognized PAG roles.",
             color=COLOR_GOLD,
         )
@@ -1224,7 +1356,8 @@ class RoleInfoCog(commands.Cog):
             ]
             if not category_records:
                 continue
-            title, emoji, _, _ = CATEGORY_META[category]
+            title, fallback_emoji, _, _ = CATEGORY_META[category]
+            emoji = str((category_emojis or {}).get(category, fallback_emoji))
             embed.add_field(
                 name=f"{emoji}  {title}",
                 value=(
@@ -1240,7 +1373,10 @@ class RoleInfoCog(commands.Cog):
                 value="There are currently no non-empty official roles to report.",
                 inline=False,
             )
-        embed.set_footer(text=f"PAG CORE  •  {_cache_status(snapshot)}")
+        emoji_count = len(category_emojis or {})
+        embed.set_footer(
+            text=f"PAG CORE  •  {_cache_status(snapshot)}  •  Animated emojis: {emoji_count}/3"
+        )
         embed.timestamp = discord.utils.utcnow()
         return embed
 
@@ -1302,8 +1438,9 @@ class RoleInfoCog(commands.Cog):
             return
         async with ctx.typing():
             snapshot = await self._collect(ctx.guild)
+        category_emojis = await self._ensure_category_emojis(ctx.guild)
         await ctx.send(
-            embed=self._stats_embed(snapshot),
+            embed=self._stats_embed(snapshot, category_emojis),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -1376,8 +1513,9 @@ class RoleInfoCog(commands.Cog):
             return
         await interaction.response.defer(thinking=True)
         snapshot = await self._collect(interaction.guild)
+        category_emojis = await self._ensure_category_emojis(interaction.guild)
         await interaction.edit_original_response(
-            embed=self._stats_embed(snapshot),
+            embed=self._stats_embed(snapshot, category_emojis),
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
